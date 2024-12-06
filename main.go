@@ -13,6 +13,7 @@ import (
 )
 
 var id = flag.String("id", "", "client id")
+var runAsServer = flag.Bool("server", false, "run as server?")
 var host = flag.String("host", "localhost:1883", "hostname of broker")
 var user = flag.String("user", "", "username")
 var pass = flag.String("pass", "", "password")
@@ -22,7 +23,8 @@ func main() {
 
 	flag.Parse()
 
-	if flag.Arg(0) == "server" {
+	if *runAsServer {
+		log.Println("Listening on", *host)
 		mqtt.ListenAndServe(*host)
 		return
 	}
