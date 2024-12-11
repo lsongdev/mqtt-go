@@ -2,12 +2,19 @@ package proto
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
+	"strings"
 )
 
 const (
 	// Maximum payload size in bytes (256MiB - 1B).
 	MaxPayloadSize = (1 << (4 * 7)) - 1
+
+	PROTOCOL_3_1   = "MQIsdp"
+	PROTOCOL_3_1_1 = "MQTT"
+	PROTOCOL_5_0   = "MQTT"
 )
 
 // Header contains the common attributes of all messages. Some attributes are
@@ -139,6 +146,7 @@ type Connect struct {
 	WillTopic, WillMessage     string
 	UsernameFlag, PasswordFlag bool
 	Username, Password         string
+	ReservedBit                byte // Added from 3.1.1
 }
 
 func (msg *Connect) Encode(w io.Writer) (err error) {
@@ -213,6 +221,10 @@ func (msg *Connect) Decode(r io.Reader, hdr Header, packetRemaining int32, confi
 
 	if packetRemaining != 0 {
 		return msgTooLongError
+	}
+
+	if err = validateProtocolVersion(msg); err != nil {
+		return err
 	}
 
 	return nil
@@ -562,5 +574,70 @@ func decodeAckCommon(r io.Reader, packetRemaining int32, messageId *uint16, conf
 		return msgTooLongError
 	}
 
+	return nil
+}
+
+func (msg *Connect) IsValidVersion() bool {
+	switch msg.ProtocolVersion {
+	case 3: // MQTT 3.1
+		return msg.ProtocolName == PROTOCOL_3_1
+	case 4: // MQTT 3.1.1
+		return msg.ProtocolName == PROTOCOL_3_1_1
+	case 5: // MQTT 5.0
+		return msg.ProtocolName == PROTOCOL_5_0
+	default:
+		return false
+	}
+}
+
+func (msg *Connect) Validate() error {
+	if msg.ReservedBit != 0 {
+		return errors.New("connect reserved bit must be 0")
+	}
+	if len(msg.ClientId) == 0 && !msg.CleanSession {
+		return errors.New("empty client id requires clean session")
+	}
+	if msg.ProtocolVersion == 4 {
+		// 允许空 ClientId
+	} else if len(msg.ClientId) < 1 || len(msg.ClientId) > 23 {
+		return errors.New("client id invalid length")
+	}
+	return nil
+}
+
+func validateProtocolVersion(msg *Connect) error {
+	switch msg.ProtocolVersion {
+	case 3: // MQTT 3.1
+		return validate31(msg)
+	case 4: // MQTT 3.1.1
+		return validate311(msg)
+	default:
+		return fmt.Errorf("unsupported protocol version: %d", msg.ProtocolVersion)
+	}
+}
+
+func validate31(msg Message) error {
+	return nil
+}
+
+func validate311(msg Message) error {
+	switch m := msg.(type) {
+	case *Connect:
+		// 3.1.1 要求 CONNECT 中的保留位必须为 0
+		if m.ReservedBit != 0 {
+			return errors.New("reserved bit must be 0 in 3.1.1")
+		}
+		// Will QoS 必须小于 3
+		if m.WillFlag && m.WillQos > 2 {
+			return errors.New("will QoS must be <= 2 in 3.1.1")
+		}
+
+	case *Publish:
+		// 3.1.1 禁止发布到 $share/ 主题
+		if strings.HasPrefix(m.TopicName, "$share/") {
+			return errors.New("cannot publish to $share/ topics in 3.1.1")
+		}
+
+	}
 	return nil
 }

@@ -210,8 +210,7 @@ func (c *incomingConn) reader() {
 		switch m := m.(type) {
 		case *proto.Connect:
 			rc := proto.RetCodeAccepted
-			if m.ProtocolName != "MQIsdp" ||
-				m.ProtocolVersion != 3 {
+			if !m.IsValidVersion() {
 				log.Print("reader: reject connection from ", m.ProtocolName, " version ", m.ProtocolVersion)
 				rc = proto.RetCodeUnacceptableProtocolVersion
 			}

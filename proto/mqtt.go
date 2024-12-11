@@ -105,12 +105,14 @@ func (qos QosLevel) HasId() bool {
 }
 
 const (
-	RetCodeAccepted = ReturnCode(iota)
-	RetCodeUnacceptableProtocolVersion
-	RetCodeIdentifierRejected
-	RetCodeServerUnavailable
-	RetCodeBadUsernameOrPassword
-	RetCodeNotAuthorized
+	RetCodeAccepted                    = ReturnCode(0)
+	RetCodeUnacceptableProtocolVersion = ReturnCode(1)
+	RetCodeIdentifierRejected          = ReturnCode(2)
+	RetCodeServerUnavailable           = ReturnCode(3)
+	RetCodeBadUsernameOrPassword       = ReturnCode(4)
+	RetCodeNotAuthorized               = ReturnCode(5)
+	RetCodeMalformedPacket             = ReturnCode(6)
+	RetCodeProtocolError               = ReturnCode(7)
 
 	retCodeFirstInvalid
 )
