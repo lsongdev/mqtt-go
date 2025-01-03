@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/song940/mqtt-go/proto"
+	"github.com/lsongdev/mqtt-go/proto"
 )
 
 // A random number generator ready to make client-id's, if

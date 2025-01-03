@@ -5,16 +5,18 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 
-	"github.com/song940/mqtt-go/mqtt"
-	"github.com/song940/mqtt-go/proto"
+	"github.com/lsongdev/mqtt-go/mqtt"
+	"github.com/lsongdev/mqtt-go/proto"
 )
 
 var id = flag.String("id", "", "client id")
 var runAsServer = flag.Bool("server", false, "run as server?")
 var host = flag.String("host", "localhost:1883", "hostname of broker")
+var websockets = flag.String("websocket", "", "websocket server")
 var user = flag.String("user", "", "username")
 var pass = flag.String("pass", "", "password")
 var dump = flag.Bool("dump", false, "dump messages?")
@@ -24,8 +26,16 @@ func main() {
 	flag.Parse()
 
 	if *runAsServer {
+		server := mqtt.NewServer()
 		log.Println("Listening on", *host)
-		mqtt.ListenAndServe(*host)
+		if *websockets != "" {
+			log.Println("Listening on", *websockets)
+			go http.ListenAndServe(*websockets, server)
+		}
+		err := mqtt.ListenAndServe(*host, server)
+		if err != nil {
+			log.Fatal(err)
+		}
 		return
 	}
 

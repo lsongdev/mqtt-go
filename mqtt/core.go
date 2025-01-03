@@ -4,7 +4,7 @@ package mqtt
 import (
 	"errors"
 
-	"github.com/song940/mqtt-go/proto"
+	"github.com/lsongdev/mqtt-go/proto"
 )
 
 // ConnectionErrors is an array of errors corresponding to the

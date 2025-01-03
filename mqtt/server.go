@@ -1,7 +1,6 @@
 package mqtt
 
 import (
-	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -12,12 +11,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/song940/mqtt-go/proto"
+	"github.com/lsongdev/mqtt-go/proto"
 )
 
 // A Server holds all the state associated with an MQTT server.
 type Server struct {
-	l             net.Listener
+	// l             net.Listener
 	subs          *subscriptions
 	stats         *stats
 	Done          chan struct{}
@@ -29,9 +28,9 @@ type Server struct {
 // the given listener. When the server is stopped (for instance by
 // another goroutine closing the net.Listener), channel Done will become
 // readable.
-func NewServer(l net.Listener) *Server {
+func NewServer() *Server {
 	svr := &Server{
-		l:             l,
+		// l:             l,
 		Done:          make(chan struct{}),
 		subs:          newSubscriptions(runtime.GOMAXPROCS(0)),
 		stats:         &stats{},
@@ -70,49 +69,25 @@ func (s *Server) newIncomingConn(conn net.Conn) *incomingConn {
 // Start makes the Server start accepting and handling connections.
 func (s *Server) Start() {
 	go func() {
-		for {
-			conn, err := s.l.Accept()
-			if err != nil {
-				log.Print("Accept: ", err)
-				break
-			}
 
-			cli := s.newIncomingConn(conn)
-			s.stats.clientConnect()
-			cli.start()
-		}
-		close(s.Done)
 	}()
 }
 
-func ListenAndServe(addr string) (err error) {
-	l, err := net.Listen("tcp", addr)
+func ListenAndServe(addr string, server *Server) (err error) {
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return
 	}
-	svr := NewServer(l)
-	svr.Start()
-	<-svr.Done
-	return
-}
-
-func ListenAndServeTLS(addr string, certFile, keyFile string) (err error) {
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Print("Accept: ", err)
+			break
+		}
+		cli := server.newIncomingConn(conn)
+		server.stats.clientConnect()
+		cli.start()
 	}
-	cfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"mqtt"},
-	}
-	l, err := tls.Listen("tcp", addr, cfg)
-	if err != nil {
-		log.Print("listen: ", err)
-		return
-	}
-	svr := NewServer(l)
-	svr.Start()
-	<-svr.Done
 	return
 }
 
