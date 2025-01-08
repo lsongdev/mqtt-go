@@ -51,6 +51,7 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("Connected with client id", cc.ClientId)
+	defer cc.Disconnect()
 
 	go func() {
 		for m := range cc.Incoming {
