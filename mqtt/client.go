@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"context"
 	crand "crypto/rand"
 
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"math/rand"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lsongdev/mqtt-go/proto"
@@ -32,33 +34,88 @@ func init() {
 // to an MQTT server. It should be allocated via NewClientConn.
 // Concurrent access to a ClientConn is NOT safe.
 type ClientConn struct {
-	conn     net.Conn
-	ClientId string        // May be set before the call to Connect.
-	id       uint16        // next MessageId
-	done     chan struct{} // This channel will be readable once a Disconnect has been successfully sent and the connection is closed.
-	out      chan job
-	Incoming chan *proto.Publish // Incoming messages arrive on this channel.
-	connack  chan *proto.ConnAck
-	suback   chan *proto.SubAck
-	Dump     bool // When true, dump the messages in and out.
+	conn            net.Conn
+	ClientId        string        // May be set before the call to Connect.
+	id              uint16        // next MessageId
+	done            chan struct{} // This channel will be readable once a Disconnect has been successfully sent and the connection is closed.
+	closed          chan struct{}
+	out             chan job
+	Incoming        chan *proto.Publish // Incoming messages arrive on this channel.
+	connack         chan *proto.ConnAck
+	suback          chan *proto.SubAck
+	unsuback        chan *proto.UnsubAck
+	Dump            bool                  // When true, dump the messages in and out.
+	ProtocolVersion proto.ProtocolVersion // Defaults to MQTT 3.1.1 (level 4).
+	decode          *proto.DecodeOptions
+	EnableQoS2      bool
+	SessionPresent  bool
+	qosMu           sync.Mutex
+	incomingQoS2    map[uint16]*proto.Publish
+	outgoingQoS2    map[uint16]*proto.Publish
+}
+
+// ClientOptions configures the modern Dial API.
+type ClientOptions struct {
+	ProtocolVersion proto.ProtocolVersion
+	ClientID        string
+	Username        string
+	Password        string
+	CleanStart      bool
+	KeepAlive       uint16
+	Properties      proto.Properties
+	EnableQoS2      bool
+	SessionExpiry   time.Duration
+}
+
+func (o ClientOptions) normalized() ClientOptions {
+	if o.ProtocolVersion == 0 {
+		o.ProtocolVersion = proto.Version311
+	}
+	if o.ClientID == "" {
+		o.CleanStart = true
+	}
+	return o
 }
 
 const clientQueueLength = 100
 
 // NewClientConn allocates a new ClientConn.
 func NewClientConn(c net.Conn) *ClientConn {
+	decode := &proto.DecodeOptions{Version: proto.Version311}
 	cc := &ClientConn{
-		conn:     c,
-		id:       1,
-		out:      make(chan job, clientQueueLength),
-		Incoming: make(chan *proto.Publish, clientQueueLength),
-		done:     make(chan struct{}),
-		connack:  make(chan *proto.ConnAck),
-		suback:   make(chan *proto.SubAck),
+		conn:            c,
+		id:              1,
+		out:             make(chan job, clientQueueLength),
+		Incoming:        make(chan *proto.Publish, clientQueueLength),
+		done:            make(chan struct{}),
+		closed:          make(chan struct{}),
+		connack:         make(chan *proto.ConnAck),
+		suback:          make(chan *proto.SubAck),
+		unsuback:        make(chan *proto.UnsubAck),
+		ProtocolVersion: proto.Version311,
+		decode:          decode,
+		incomingQoS2:    make(map[uint16]*proto.Publish),
+		outgoingQoS2:    make(map[uint16]*proto.Publish),
 	}
 	go cc.reader()
 	go cc.writer()
 	return cc
+}
+
+// Dial connects and completes the MQTT handshake in one call. It is the
+// recommended API for applications embedding the client.
+func Dial(ctx context.Context, address string, options ClientOptions) (*ClientConn, error) {
+	options = options.normalized()
+	nc, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
+	if err != nil {
+		return nil, err
+	}
+	c := NewClientConn(nc)
+	if err := c.ConnectContext(ctx, options); err != nil {
+		nc.Close()
+		return nil, err
+	}
+	return c, nil
 }
 
 func NewClient(host string) (conn *ClientConn, err error) {
@@ -72,16 +129,15 @@ func NewClient(host string) (conn *ClientConn, err error) {
 
 func (c *ClientConn) reader() {
 	defer func() {
-		// Cause the writer to exit.
-		close(c.out)
 		// Cause any goroutines waiting on messages to arrive to exit.
 		close(c.Incoming)
+		close(c.closed)
 		c.conn.Close()
 	}()
 
 	for {
 		// TODO: timeout (first message and/or keepalives)
-		m, err := proto.DecodeOneMessage(c.conn, nil)
+		m, err := proto.DecodeOneMessage(c.conn, c.decode)
 		if err != nil {
 			if err == io.EOF {
 				return
@@ -99,14 +155,54 @@ func (c *ClientConn) reader() {
 
 		switch m := m.(type) {
 		case *proto.Publish:
+			if m.QosLevel == proto.QosExactlyOnce {
+				if !c.EnableQoS2 {
+					return
+				}
+				c.qosMu.Lock()
+				if _, exists := c.incomingQoS2[m.MessageId]; !exists {
+					copy := *m
+					c.incomingQoS2[m.MessageId] = &copy
+				}
+				c.qosMu.Unlock()
+				c.out <- job{m: &proto.PubRec{MessageId: m.MessageId}}
+				continue
+			}
+			if m.QosLevel == proto.QosAtLeastOnce {
+				c.out <- job{m: &proto.PubAck{MessageId: m.MessageId}}
+			}
 			c.Incoming <- m
 		case *proto.PubAck:
 			// ignore these
 			continue
+		case *proto.PubRec:
+			c.qosMu.Lock()
+			_, ok := c.outgoingQoS2[m.MessageId]
+			c.qosMu.Unlock()
+			if ok {
+				c.out <- job{m: &proto.PubRel{MessageId: m.MessageId}}
+			}
+		case *proto.PubRel:
+			c.qosMu.Lock()
+			publish, ok := c.incomingQoS2[m.MessageId]
+			if ok {
+				delete(c.incomingQoS2, m.MessageId)
+			}
+			c.qosMu.Unlock()
+			if ok {
+				c.Incoming <- publish
+			}
+			c.out <- job{m: &proto.PubComp{MessageId: m.MessageId}}
+		case *proto.PubComp:
+			c.qosMu.Lock()
+			delete(c.outgoingQoS2, m.MessageId)
+			c.qosMu.Unlock()
 		case *proto.ConnAck:
 			c.connack <- m
 		case *proto.SubAck:
 			c.suback <- m
+		case *proto.UnsubAck:
+			c.unsuback <- m
 		case *proto.Disconnect:
 			return
 		default:
@@ -121,16 +217,26 @@ func (c *ClientConn) writer() {
 		// Signal to Disconnect() that the message is on its way, or
 		// that the connection is closing one way or the other...
 		close(c.done)
+		c.conn.Close()
 	}()
 
-	for job := range c.out {
+	for {
+		var next job
+		select {
+		case next = <-c.out:
+		case <-c.closed:
+			return
+		}
+		job := next
 		if c.Dump {
 			log.Printf("dump out: %T", job.m)
 		}
 
 		// TODO: write timeout
+		proto.SetVersion(job.m, c.ProtocolVersion)
 		err := job.m.Encode(c.conn)
 		if job.r != nil {
+			job.r <- err
 			close(job.r)
 		}
 
@@ -149,35 +255,106 @@ func (c *ClientConn) writer() {
 // set, use a default (a 63-bit decimal random number). The "clean session"
 // bit is always set.
 func (c *ClientConn) Connect(user, pass string) error {
+	return c.ConnectWithOptions(ClientOptions{ProtocolVersion: c.ProtocolVersion, ClientID: c.ClientId, Username: user, Password: pass, CleanStart: true})
+}
+
+// ConnectWithOptions sends a versioned CONNECT packet on an existing transport.
+func (c *ClientConn) ConnectWithOptions(options ClientOptions) error {
+	options = options.normalized()
 	// TODO: Keepalive timer
-	if c.ClientId == "" {
-		c.ClientId = fmt.Sprint(cliRand.Int63())
+	if options.ClientID == "" {
+		options.ClientID = fmt.Sprint(cliRand.Int63())
 	}
+	c.ClientId = options.ClientID
+	c.ProtocolVersion = options.ProtocolVersion
+	c.EnableQoS2 = options.EnableQoS2
+	c.decode.Version = options.ProtocolVersion
 	req := &proto.Connect{
-		ProtocolName:    "MQIsdp",
-		ProtocolVersion: 3,
+		ProtocolName:    proto.PROTOCOL_3_1_1,
+		ProtocolVersion: uint8(options.ProtocolVersion),
 		ClientId:        c.ClientId,
-		CleanSession:    true,
+		CleanSession:    options.CleanStart,
+		KeepAliveTimer:  options.KeepAlive,
+		Properties:      options.Properties,
 	}
-	if user != "" {
+	if options.Username != "" {
 		req.UsernameFlag = true
+		req.Username = options.Username
+	}
+	if options.Password != "" {
 		req.PasswordFlag = true
-		req.Username = user
-		req.Password = pass
+		req.Password = options.Password
+	}
+	if options.ProtocolVersion == proto.Version5 && options.SessionExpiry > 0 {
+		if _, exists := propertyUint32(req.Properties, proto.PropertySessionExpiryInterval); !exists {
+			seconds := uint64((options.SessionExpiry + time.Second - 1) / time.Second)
+			if seconds > uint64(^uint32(0)) {
+				seconds = uint64(^uint32(0))
+			}
+			req.Properties = req.Properties.Add(proto.PropertySessionExpiryInterval, uint32(seconds))
+		}
+	}
+	if err := req.Validate(); err != nil {
+		return err
 	}
 
-	c.sync(req)
-	ack := <-c.connack
-	return ConnectionErrors[ack.ReturnCode]
+	if err := c.sync(req); err != nil {
+		return err
+	}
+	var ack *proto.ConnAck
+	select {
+	case ack = <-c.connack:
+	case <-c.closed:
+		return ErrClientClosed
+	}
+	if ack.ReturnCode == proto.RetCodeAccepted {
+		c.SessionPresent = ack.SessionPresent
+		return nil
+	}
+	if int(ack.ReturnCode) < len(ConnectionErrors) {
+		return ConnectionErrors[ack.ReturnCode]
+	}
+	return fmt.Errorf("connection refused: reason code 0x%02x", uint8(ack.ReturnCode))
+}
+
+// ConnectContext is ConnectWithOptions with cancellation and deadline support.
+func (c *ClientConn) ConnectContext(ctx context.Context, options ClientOptions) error {
+	stop := context.AfterFunc(ctx, func() { _ = c.conn.SetDeadline(time.Now()) })
+	defer func() { stop(); _ = c.conn.SetDeadline(time.Time{}) }()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = c.conn.SetDeadline(deadline)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	err := c.ConnectWithOptions(options)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if deadline, ok := ctx.Deadline(); err != nil && ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return err
 }
 
 // Disconnect sends a DISCONNECT message to the server. This function
 // blocks until the disconnect message is actually sent, and the connection
 // is closed.
 func (c *ClientConn) Disconnect() {
-	c.sync(&proto.Disconnect{})
+	select {
+	case <-c.closed:
+		<-c.done
+		return
+	default:
+	}
+	m := &proto.Disconnect{}
+	proto.SetVersion(m, c.ProtocolVersion)
+	_ = c.sync(m)
 	<-c.done
 }
+
+// Close immediately closes the underlying transport.
+func (c *ClientConn) Close() error { return c.conn.Close() }
 
 func (c *ClientConn) nextid() uint16 {
 	id := c.id
@@ -188,28 +365,69 @@ func (c *ClientConn) nextid() uint16 {
 // Subscribe subscribes this connection to a list of topics. Messages
 // will be delivered on the Incoming channel.
 func (c *ClientConn) Subscribe(tqs []proto.TopicQos) *proto.SubAck {
-	c.sync(&proto.Subscribe{
+	m := &proto.Subscribe{
 		Header:    header(dupFalse, proto.QosAtLeastOnce, retainFalse),
 		MessageId: c.nextid(),
 		Topics:    tqs,
-	})
-	ack := <-c.suback
-	return ack
+	}
+	proto.SetVersion(m, c.ProtocolVersion)
+	if err := c.sync(m); err != nil {
+		return nil
+	}
+	select {
+	case ack := <-c.suback:
+		return ack
+	case <-c.closed:
+		return nil
+	}
+}
+
+// Unsubscribe removes the given topic filters and waits for UNSUBACK.
+func (c *ClientConn) Unsubscribe(topics []string) *proto.UnsubAck {
+	m := &proto.Unsubscribe{MessageId: c.nextid(), Topics: topics}
+	proto.SetVersion(m, c.ProtocolVersion)
+	if err := c.sync(m); err != nil {
+		return nil
+	}
+	select {
+	case ack := <-c.unsuback:
+		return ack
+	case <-c.closed:
+		return nil
+	}
 }
 
 // Publish publishes the given message to the MQTT server.
-// The QosLevel of the message must be QosAtLeastOnce for now.
+// QoS 0 and QoS 1 are always supported. QoS 2 requires EnableQoS2 in the
+// ClientOptions used to connect.
 func (c *ClientConn) Publish(m *proto.Publish) {
-	if m.QosLevel != proto.QosAtMostOnce {
+	if m.QosLevel > proto.QosExactlyOnce || (m.QosLevel == proto.QosExactlyOnce && !c.EnableQoS2) {
 		panic("unsupported QoS level")
 	}
-	m.MessageId = c.nextid()
+	if m.QosLevel.HasId() {
+		m.MessageId = c.nextid()
+	}
+	proto.SetVersion(m, c.ProtocolVersion)
+	if m.QosLevel == proto.QosExactlyOnce {
+		c.qosMu.Lock()
+		c.outgoingQoS2[m.MessageId] = m
+		c.qosMu.Unlock()
+	}
 	c.out <- job{m: m}
 }
 
 // sync sends a message and blocks until it was actually sent.
-func (c *ClientConn) sync(m proto.Message) {
-	j := job{m: m, r: make(receipt)}
-	c.out <- j
-	<-j.r
+func (c *ClientConn) sync(m proto.Message) (err error) {
+	j := job{m: m, r: make(receipt, 1)}
+	select {
+	case c.out <- j:
+	case <-c.closed:
+		return ErrClientClosed
+	}
+	select {
+	case err = <-j.r:
+		return err
+	case <-c.closed:
+		return ErrClientClosed
+	}
 }

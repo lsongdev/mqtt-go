@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -22,6 +23,25 @@ type Server struct {
 	Done          chan struct{}
 	StatsInterval time.Duration // Defaults to 10 seconds. Must be set using sync/atomic.StoreInt64().
 	Dump          bool          // When true, dump the messages in and out.
+	clientsMu     sync.Mutex
+	clients       map[string]*incomingConn
+	options       ServerOptions
+	sessionsMu    sync.Mutex
+	sessions      map[string]*sessionState
+	closeOnce     sync.Once
+}
+
+// ServerOptions enables broker features that require additional state.
+// All features are off by default to preserve the small in-memory profile.
+type ServerOptions struct {
+	EnableQoS2                bool
+	EnablePersistentSessions  bool
+	EnableSharedSubscriptions bool
+	SessionStore              SessionStore
+}
+
+func (s *Server) persistentSessionsEnabled() bool {
+	return s.options.EnablePersistentSessions || s.options.SessionStore != nil
 }
 
 // NewServer creates a new MQTT server, which accepts connections from
@@ -29,16 +49,44 @@ type Server struct {
 // another goroutine closing the net.Listener), channel Done will become
 // readable.
 func NewServer() *Server {
+	svr, _ := NewServerWithOptions(ServerOptions{})
+	return svr
+}
+
+// NewServerWithOptions creates a broker with explicitly enabled optional
+// features. It restores unexpired sessions before accepting connections.
+func NewServerWithOptions(options ServerOptions) (*Server, error) {
 	svr := &Server{
 		// l:             l,
 		Done:          make(chan struct{}),
 		subs:          newSubscriptions(runtime.GOMAXPROCS(0)),
 		stats:         &stats{},
+		clients:       make(map[string]*incomingConn),
 		StatsInterval: time.Second * 10,
+		options:       options,
+		sessions:      make(map[string]*sessionState),
+	}
+	if options.SessionStore != nil {
+		stored, err := options.SessionStore.List(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		for i := range stored {
+			state := &sessionState{StoredSession: stored[i], server: svr}
+			for _, m := range state.Queue {
+				if m.ID > state.nextQueueID {
+					state.nextQueueID = m.ID
+				}
+			}
+			svr.sessions[state.ClientID] = state
+			for _, sub := range state.Subscriptions {
+				svr.subs.addStored(sub, state, nil)
+			}
+		}
 	}
 	// start the stats reporting goroutine
 	go svr.report()
-	return svr
+	return svr, nil
 }
 
 func (svr *Server) report() {
@@ -60,9 +108,16 @@ func (svr *Server) report() {
 // channel becomes readable.
 func (s *Server) newIncomingConn(conn net.Conn) *incomingConn {
 	return &incomingConn{
-		svr:  s,
-		conn: conn,
-		jobs: make(chan job, sendingQueueLength),
+		svr:            s,
+		conn:           conn,
+		jobs:           make(chan job, sendingQueueLength),
+		decode:         &proto.DecodeOptions{Version: proto.Version311},
+		version:        proto.Version311,
+		nextID:         1,
+		incomingQoS2:   make(map[uint16]*proto.Publish),
+		outgoingQoS2:   make(map[uint16]*proto.Publish),
+		outgoingStored: make(map[uint16]uint64),
+		done:           make(chan struct{}),
 	}
 }
 
@@ -78,29 +133,67 @@ func ListenAndServe(addr string, server *Server) (err error) {
 	if err != nil {
 		return
 	}
+	return server.Serve(listener)
+}
+
+// Serve accepts MQTT connections from listener. Supplying the listener makes
+// the broker easy to embed in applications and tests (including TLS or Unix
+// sockets chosen by the caller).
+func (s *Server) Serve(listener net.Listener) error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Print("Accept: ", err)
-			break
+			return err
 		}
-		cli := server.newIncomingConn(conn)
-		server.stats.clientConnect()
-		cli.start()
+		s.ServeConn(conn)
 	}
-	return
 }
 
-var clientsMu sync.Mutex
+// ServeConn hands an already-established transport to the broker.
+func (s *Server) ServeConn(conn net.Conn) {
+	cli := s.newIncomingConn(conn)
+	s.stats.clientConnect()
+	cli.start()
+}
+
+// Close stops reporting and closes active client transports. A caller-owned
+// listener and SessionStore remain owned by the caller and must be closed
+// separately.
+func (s *Server) Close() error {
+	s.closeOnce.Do(func() {
+		close(s.Done)
+		s.clientsMu.Lock()
+		connections := make([]net.Conn, 0, len(s.clients))
+		for _, client := range s.clients {
+			connections = append(connections, client.conn)
+		}
+		s.clientsMu.Unlock()
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+	})
+	return nil
+}
 
 const sendingQueueLength = 10000
 
 // An IncomingConn represents a connection into a Server.
 type incomingConn struct {
-	svr      *Server
-	conn     net.Conn
-	jobs     chan job
-	clientid string
+	svr            *Server
+	conn           net.Conn
+	jobs           chan job
+	clientid       string
+	version        proto.ProtocolVersion
+	decode         *proto.DecodeOptions
+	nextID         uint16
+	idMu           sync.Mutex
+	session        *sessionState
+	persistent     bool
+	incomingQoS2   map[uint16]*proto.Publish
+	outgoingQoS2   map[uint16]*proto.Publish
+	outgoingStored map[uint16]uint64
+	qosMu          sync.Mutex
+	done           chan struct{}
 }
 
 // Start reading and writing on this connection.
@@ -112,28 +205,31 @@ func (c *incomingConn) start() {
 // Add this connection to the map, or find out that an existing connection
 // already exists for the same client-id.
 func (c *incomingConn) add() *incomingConn {
-	clientsMu.Lock()
-	defer clientsMu.Unlock()
+	c.svr.clientsMu.Lock()
+	defer c.svr.clientsMu.Unlock()
 
-	existing, ok := clients[c.clientid]
+	existing, ok := c.svr.clients[c.clientid]
 	if ok {
 		// this client id already exists, return it
 		return existing
 	}
 
-	clients[c.clientid] = c
+	c.svr.clients[c.clientid] = c
 	return nil
 }
 
 // Delete a connection; the connection must be closed by the caller first.
 func (c *incomingConn) del() {
-	clientsMu.Lock()
-	delete(clients, c.clientid)
-	clientsMu.Unlock()
+	c.svr.clientsMu.Lock()
+	if c.svr.clients[c.clientid] == c {
+		delete(c.svr.clients, c.clientid)
+	}
+	c.svr.clientsMu.Unlock()
 }
 
 // Queue a message; no notification of sending is done.
 func (c *incomingConn) submit(m proto.Message) {
+	proto.SetVersion(m, c.version)
 	j := job{m: m}
 	select {
 	case c.jobs <- j:
@@ -145,7 +241,7 @@ func (c *incomingConn) submit(m proto.Message) {
 // Queue a message, returns a channel that will be readable
 // when the message is sent.
 func (c *incomingConn) submitSync(m proto.Message) receipt {
-	j := job{m: m, r: make(receipt)}
+	j := job{m: m, r: make(receipt, 1)}
 	c.jobs <- j
 	return j.r
 }
@@ -165,7 +261,7 @@ func (c *incomingConn) reader() {
 
 	for {
 		// TODO: timeout (first message and/or keepalives)
-		m, err := proto.DecodeOneMessage(c.conn, nil)
+		m, err := proto.DecodeOneMessage(c.conn, c.decode)
 		if err != nil {
 			if err == io.EOF {
 				return
@@ -184,6 +280,11 @@ func (c *incomingConn) reader() {
 
 		switch m := m.(type) {
 		case *proto.Connect:
+			if c.clientid != "" {
+				return
+			}
+			c.version = proto.ProtocolVersion(m.ProtocolVersion)
+			c.decode.Version = c.version
 			rc := proto.RetCodeAccepted
 			if !m.IsValidVersion() {
 				log.Print("reader: reject connection from ", m.ProtocolName, " version ", m.ProtocolVersion)
@@ -191,23 +292,40 @@ func (c *incomingConn) reader() {
 			}
 
 			// Check client id.
-			if len(m.ClientId) < 1 || len(m.ClientId) > 23 {
+			if len(m.ClientId) < 1 && !m.CleanSession {
 				rc = proto.RetCodeIdentifierRejected
 			}
 			c.clientid = m.ClientId
-
 			// Disconnect existing connections.
 			if existing := c.add(); existing != nil {
 				disconnect := &proto.Disconnect{}
 				r := existing.submitSync(disconnect)
-				r.wait()
-				c.add()
+				_ = r.wait()
+				<-existing.done
+				c.svr.clientsMu.Lock()
+				c.svr.clients[c.clientid] = c
+				c.svr.clientsMu.Unlock()
+			}
+			sessionPresent := false
+			if rc == proto.RetCodeAccepted {
+				sessionPresent = c.svr.attachSession(c, m)
 			}
 
 			// TODO: Last will
 
-			connack := &proto.ConnAck{
-				ReturnCode: rc,
+			connack := &proto.ConnAck{ReturnCode: rc, SessionPresent: sessionPresent}
+			if c.version == proto.Version5 && rc != proto.RetCodeAccepted {
+				if rc == proto.RetCodeUnacceptableProtocolVersion {
+					connack.ReturnCode = proto.ReturnCode(0x84)
+				} else if rc == proto.RetCodeIdentifierRejected {
+					connack.ReturnCode = proto.ReturnCode(0x85)
+				}
+			}
+			if c.version == proto.Version5 && !c.svr.options.EnableQoS2 {
+				connack.Properties = connack.Properties.Add(proto.PropertyMaximumQoS, byte(1))
+			}
+			if c.version == proto.Version5 {
+				connack.Properties = connack.Properties.Add(proto.PropertySharedSubscriptionAvailable, boolToProperty(c.svr.options.EnableSharedSubscriptions))
 			}
 			c.submit(connack)
 
@@ -216,6 +334,7 @@ func (c *incomingConn) reader() {
 				log.Printf("Connection refused for %v: %v", c.conn.RemoteAddr(), ConnectionErrors[rc])
 				return
 			}
+			c.deliverSessionQueue()
 
 			// Log in mosquitto format.
 			clean := 0
@@ -225,10 +344,21 @@ func (c *incomingConn) reader() {
 			log.Printf("New client connected from %v as %v (c%v, k%v).", c.conn.RemoteAddr(), c.clientid, clean, m.KeepAliveTimer)
 
 		case *proto.Publish:
-			// TODO: Proper QoS support
-			if m.Header.QosLevel != proto.QosAtMostOnce {
-				log.Printf("reader: no support for QoS %v yet", m.Header.QosLevel)
+			if c.clientid == "" {
 				return
+			}
+			if m.Header.QosLevel == proto.QosExactlyOnce {
+				if !c.svr.options.EnableQoS2 || m.MessageId == 0 {
+					return
+				}
+				c.qosMu.Lock()
+				if _, exists := c.incomingQoS2[m.MessageId]; !exists {
+					copy := *m
+					c.incomingQoS2[m.MessageId] = &copy
+				}
+				c.qosMu.Unlock()
+				c.submit(&proto.PubRec{MessageId: m.MessageId})
+				continue
 			}
 			if m.Header.QosLevel != proto.QosAtMostOnce && m.MessageId == 0 {
 				// Invalid message ID. See MQTT-2.3.1-1.
@@ -242,12 +372,65 @@ func (c *incomingConn) reader() {
 			}
 			// https://github.com/jeffallen/mqtt/pull/16
 			// https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718041
-			c.submit(&proto.PubAck{MessageId: m.MessageId})
+			if m.Header.QosLevel == proto.QosAtLeastOnce {
+				c.submit(&proto.PubAck{MessageId: m.MessageId})
+			}
 
 		case *proto.PingReq:
+			if c.clientid == "" {
+				return
+			}
 			c.submit(&proto.PingResp{})
 
+		case *proto.PubAck:
+			// QoS 1 delivery is complete. Messages are held in memory only, so
+			// there is no persistent inflight record to remove.
+			c.ackOutgoing(m.MessageId)
+			continue
+
+		case *proto.PubRec:
+			if !c.svr.options.EnableQoS2 {
+				return
+			}
+			c.qosMu.Lock()
+			_, ok := c.outgoingQoS2[m.MessageId]
+			storedID := c.outgoingStored[m.MessageId]
+			c.qosMu.Unlock()
+			if ok {
+				if storedID != 0 {
+					c.svr.markSessionDelivery(c.session, storedID, m.MessageId, 1)
+				}
+				c.submit(&proto.PubRel{MessageId: m.MessageId})
+			}
+
+		case *proto.PubRel:
+			if !c.svr.options.EnableQoS2 {
+				return
+			}
+			c.qosMu.Lock()
+			publish, ok := c.incomingQoS2[m.MessageId]
+			if ok {
+				delete(c.incomingQoS2, m.MessageId)
+			}
+			c.qosMu.Unlock()
+			if ok {
+				c.svr.subs.submit(c, publish)
+			}
+			c.submit(&proto.PubComp{MessageId: m.MessageId})
+
+		case *proto.PubComp:
+			if !c.svr.options.EnableQoS2 {
+				return
+			}
+			c.qosMu.Lock()
+			delete(c.outgoingQoS2, m.MessageId)
+			c.qosMu.Unlock()
+			c.ackOutgoing(m.MessageId)
+
 		case *proto.Subscribe:
+			if c.clientid == "" {
+				return
+			}
 			if m.Header.QosLevel != proto.QosAtLeastOnce {
 				// protocol error, disconnect
 				return
@@ -261,19 +444,49 @@ func (c *incomingConn) reader() {
 				MessageId: m.MessageId,
 				TopicsQos: make([]proto.QosLevel, len(m.Topics)),
 			}
+			if c.version == proto.Version5 {
+				suback.ReasonCodes = make([]proto.ReasonCode, len(m.Topics))
+			}
+			newSubscriptions := make([]bool, len(m.Topics))
 			for i, tq := range m.Topics {
-				// TODO: Handle varying QoS correctly
-				c.svr.subs.add(tq.Topic, c)
-				suback.TopicsQos[i] = proto.QosAtMostOnce
+				group, filter, valid := parseSharedFilter(tq.Topic)
+				sharedUnsupported := group != "" && !c.svr.options.EnableSharedSubscriptions
+				if !valid || sharedUnsupported || (group != "" && tq.NoLocal) || filter == "" || (isWildcard(filter) && !newWild(filter, nil).valid()) {
+					suback.TopicsQos[i] = proto.QosLevel(0x80)
+					if c.version == proto.Version5 {
+						if sharedUnsupported {
+							suback.ReasonCodes[i] = 0x9e
+						} else {
+							suback.ReasonCodes[i] = 0x8f
+						}
+					}
+					continue
+				}
+				granted := tq.Qos
+				if granted > proto.QosAtLeastOnce && !c.svr.options.EnableQoS2 {
+					granted = proto.QosAtLeastOnce
+				}
+				tq.Qos = granted
+				newSubscriptions[i] = c.svr.subs.add(tq, c)
+				c.svr.recordSubscription(c, tq)
+				suback.TopicsQos[i] = granted
+				if c.version == proto.Version5 {
+					suback.ReasonCodes[i] = proto.ReasonCode(granted)
+				}
 			}
 			c.submit(suback)
 
 			// Process retained messages.
-			for _, tq := range m.Topics {
-				c.svr.subs.sendRetain(tq.Topic, c)
+			for i, tq := range m.Topics {
+				if suback.TopicsQos[i] != proto.QosLevel(0x80) && tq.RetainHandling != 2 && (tq.RetainHandling == 0 || newSubscriptions[i]) {
+					c.svr.subs.sendRetain(tq, c)
+				}
 			}
 
 		case *proto.Unsubscribe:
+			if c.clientid == "" {
+				return
+			}
 			if m.Header.QosLevel != proto.QosAtMostOnce && m.MessageId == 0 {
 				// Invalid message ID. See MQTT-2.3.1-1.
 				log.Printf("reader: invalid MessageId in UNSUBSCRIBE.")
@@ -281,11 +494,16 @@ func (c *incomingConn) reader() {
 			}
 			for _, t := range m.Topics {
 				c.svr.subs.unsub(t, c)
+				c.svr.removeSubscription(c, t)
 			}
 			ack := &proto.UnsubAck{MessageId: m.MessageId}
+			if c.version == proto.Version5 {
+				ack.ReasonCodes = make([]proto.ReasonCode, len(m.Topics))
+			}
 			c.submit(ack)
 
 		case *proto.Disconnect:
+			c.svr.updateSessionExpiry(c, m.Properties)
 			return
 
 		default:
@@ -300,7 +518,8 @@ func (c *incomingConn) writer() {
 	defer func() {
 		c.conn.Close()
 		c.del()
-		c.svr.subs.unsubAll(c)
+		c.svr.detachSession(c)
+		close(c.done)
 	}()
 
 	for job := range c.jobs {
@@ -311,7 +530,7 @@ func (c *incomingConn) writer() {
 		// TODO: write timeout
 		err := job.m.Encode(c.conn)
 		if job.r != nil {
-			// notifiy the sender that this message is sent
+			job.r <- err
 			close(job.r)
 		}
 		if err != nil {
@@ -354,12 +573,31 @@ type post struct {
 }
 
 type subscriptions struct {
-	workers   int
-	mu        sync.Mutex // guards access to fields below
-	posts     chan post
-	retain    map[string]retain
-	subs      map[string][]*incomingConn // topic <-> conns
-	wildcards []wild
+	workers    int
+	mu         sync.Mutex // guards access to fields below
+	posts      chan post
+	retain     map[string]retain
+	subs       map[string][]subscription // topic <-> conns
+	wildcards  []wild
+	roundRobin map[string]uint64
+}
+
+type subscription struct {
+	c                          *incomingConn
+	qos                        proto.QosLevel
+	noLocal, retainAsPublished bool
+	session                    *sessionState
+	filter, shareGroup         string
+}
+
+func (s subscription) clientID() string {
+	if s.session != nil {
+		return s.session.ClientID
+	}
+	if s.c != nil {
+		return s.c.clientid
+	}
+	return ""
 }
 
 // The length of the queue that subscription processing
@@ -368,10 +606,11 @@ const postQueue = 100
 
 func newSubscriptions(workers int) *subscriptions {
 	s := &subscriptions{
-		subs:    make(map[string][]*incomingConn),
-		retain:  make(map[string]retain),
-		posts:   make(chan post, postQueue),
-		workers: workers,
+		subs:       make(map[string][]subscription),
+		retain:     make(map[string]retain),
+		posts:      make(chan post, postQueue),
+		workers:    workers,
+		roundRobin: make(map[string]uint64),
 	}
 	for i := 0; i < s.workers; i++ {
 		go s.run(i)
@@ -379,92 +618,229 @@ func newSubscriptions(workers int) *subscriptions {
 	return s
 }
 
-func (s *subscriptions) sendRetain(topic string, c *incomingConn) {
+func (s *subscriptions) sendRetain(tq proto.TopicQos, c *incomingConn) {
 	s.mu.Lock()
-	var tlist []string
-	if isWildcard(topic) {
-		// TODO: select matching topics from the retain map
-	} else {
-		tlist = []string{topic}
-	}
-	for _, t := range tlist {
-		if r, ok := s.retain[t]; ok {
-			c.submit(&r.m)
+	var messages []proto.Publish
+	_, filter, _ := parseSharedFilter(tq.Topic)
+	w := newWild(filter, nil)
+	for name, retained := range s.retain {
+		if (!isWildcard(filter) && name == filter) || (isWildcard(filter) && w.matches(strings.Split(name, "/"))) {
+			m := retained.m
+			if m.QosLevel > tq.Qos {
+				m.QosLevel = tq.Qos
+			}
+			if m.QosLevel.HasId() {
+				m.MessageId = c.nextMessageID()
+			}
+			messages = append(messages, m)
 		}
 	}
 	s.mu.Unlock()
+	for i := range messages {
+		storedID := uint64(0)
+		if c.persistent && messages[i].QosLevel > proto.QosAtMostOnce {
+			if stored, ok := storedPublish(&messages[i]); ok {
+				storedID = c.svr.queueSession(c.session, stored)
+			}
+		}
+		c.trackAndSubmit(&messages[i], storedID)
+	}
 }
 
-func (s *subscriptions) add(topic string, c *incomingConn) {
+func (s *subscriptions) add(tq proto.TopicQos, c *incomingConn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if isWildcard(topic) {
-		w := newWild(topic, c)
+	group, filter, _ := parseSharedFilter(tq.Topic)
+	sub := subscription{c: c, qos: tq.Qos, noLocal: tq.NoLocal, retainAsPublished: tq.RetainAsPublished, session: c.session, filter: tq.Topic, shareGroup: group}
+	if isWildcard(filter) {
+		for i := range s.wildcards {
+			if s.wildcards[i].sub.clientID() == c.clientid && s.wildcards[i].sub.filter == tq.Topic {
+				s.wildcards[i].sub = sub
+				return false
+			}
+		}
+		w := newWild(filter, c)
+		w.sub = sub
 		if w.valid() {
 			s.wildcards = append(s.wildcards, w)
 		} else {
-			log.Println("invalid wildcard", topic)
+			log.Println("invalid wildcard", tq.Topic)
 		}
-		return
+		return true
 	}
-	s.subs[topic] = append(s.subs[topic], c)
+	for i := range s.subs[filter] {
+		if s.subs[filter][i].clientID() == c.clientid && s.subs[filter][i].filter == tq.Topic {
+			s.subs[filter][i] = sub
+			return false
+		}
+	}
+	s.subs[filter] = append(s.subs[filter], sub)
+	return true
+}
+
+func (s *subscriptions) addStored(stored StoredSubscription, state *sessionState, c *incomingConn) {
+	tq := proto.TopicQos{Topic: stored.Filter, Qos: stored.QoS, NoLocal: stored.NoLocal, RetainAsPublished: stored.RetainAsPublished, RetainHandling: stored.RetainHandling}
+	placeholder := &incomingConn{clientid: state.ClientID, session: state}
+	if c != nil {
+		placeholder = c
+	}
+	s.add(tq, placeholder)
+	if c == nil {
+		s.detach(placeholder, true)
+	}
+}
+
+func (s *subscriptions) bind(clientID string, c *incomingConn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for topic, list := range s.subs {
+		for i := range list {
+			if list[i].clientID() == clientID {
+				list[i].c = c
+				list[i].session = c.session
+			}
+		}
+		s.subs[topic] = list
+	}
+	for i := range s.wildcards {
+		if s.wildcards[i].sub.clientID() == clientID {
+			s.wildcards[i].sub.c = c
+			s.wildcards[i].sub.session = c.session
+		}
+	}
+}
+
+func (s *subscriptions) removeClient(clientID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for topic, list := range s.subs {
+		out := list[:0]
+		for _, sub := range list {
+			if sub.clientID() != clientID {
+				out = append(out, sub)
+			}
+		}
+		if len(out) == 0 {
+			delete(s.subs, topic)
+		} else {
+			s.subs[topic] = out
+		}
+	}
+	out := s.wildcards[:0]
+	for _, w := range s.wildcards {
+		if w.sub.clientID() != clientID {
+			out = append(out, w)
+		}
+	}
+	s.wildcards = out
+}
+
+func (s *subscriptions) detach(c *incomingConn, preserve bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for topic, list := range s.subs {
+		out := list[:0]
+		for _, sub := range list {
+			if sub.c == c {
+				if preserve {
+					sub.c = nil
+					out = append(out, sub)
+				}
+			} else {
+				out = append(out, sub)
+			}
+		}
+		if len(out) == 0 {
+			delete(s.subs, topic)
+		} else {
+			s.subs[topic] = out
+		}
+	}
+	out := s.wildcards[:0]
+	for _, w := range s.wildcards {
+		if w.sub.c == c {
+			if preserve {
+				w.sub.c = nil
+				out = append(out, w)
+			}
+		} else {
+			out = append(out, w)
+		}
+	}
+	s.wildcards = out
 }
 
 // Find all connections that are subscribed to this topic.
-func (s *subscriptions) subscribers(topic string) []*incomingConn {
+func (s *subscriptions) subscribers(topic string) []subscription {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// non-wildcard subscribers
-	subscribers := s.subs[topic]
+	candidates := append([]subscription(nil), s.subs[topic]...)
 	// process wildcards
 	parts := strings.Split(topic, "/")
 	for _, w := range s.wildcards {
 		if w.matches(parts) {
-			subscribers = append(subscribers, w.c)
+			candidates = append(candidates, w.sub)
 		}
+	}
+	var subscribers []subscription
+	groups := make(map[string][]subscription)
+	for _, sub := range candidates {
+		if sub.shareGroup == "" {
+			subscribers = append(subscribers, sub)
+		} else {
+			key := sub.shareGroup + "\x00" + sub.filter
+			groups[key] = append(groups[key], sub)
+		}
+	}
+	for key, list := range groups {
+		var online []subscription
+		for _, sub := range list {
+			if sub.c != nil {
+				online = append(online, sub)
+			}
+		}
+		if len(online) > 0 {
+			list = online
+		}
+		index := s.roundRobin[key] % uint64(len(list))
+		s.roundRobin[key]++
+		subscribers = append(subscribers, list[index])
 	}
 	return subscribers
 }
 
 // Remove all subscriptions that refer to a connection.
 func (s *subscriptions) unsubAll(c *incomingConn) {
-	s.mu.Lock()
-	for _ /*topic*/, v := range s.subs {
-		for i := range v {
-			if v[i] == c {
-				v[i] = nil
-			}
-		}
-	}
-
-	// remove any associated entries in the wildcard list
-	var wildNew []wild
-	for i := 0; i < len(s.wildcards); i++ {
-		if s.wildcards[i].c != c { // filter out the connection
-			wildNew = append(wildNew, s.wildcards[i])
-		}
-	}
-	s.wildcards = wildNew
-	s.mu.Unlock()
+	s.detach(c, false)
 }
 
 // Remove the subscription to topic for a given connection.
 func (s *subscriptions) unsub(topic string, c *incomingConn) {
 	s.mu.Lock()
-	if conns, ok := s.subs[topic]; ok {
-		nils := 0
-		// Search the list, removing references to our connection.
-		// At the same time, count the nils to see if this list is now empty.
-		for i := 0; i < len(conns); i++ {
-			if conns[i] == c {
-				conns[i] = nil
-			}
-			if conns[i] == nil {
-				nils++
+	_, filter, _ := parseSharedFilter(topic)
+	if isWildcard(filter) {
+		filtered := s.wildcards[:0]
+		for _, w := range s.wildcards {
+			if w.sub.clientID() != c.clientid || w.sub.filter != topic {
+				filtered = append(filtered, w)
 			}
 		}
-		if nils == len(conns) {
-			delete(s.subs, topic)
+		s.wildcards = filtered
+		s.mu.Unlock()
+		return
+	}
+	if conns, ok := s.subs[filter]; ok {
+		out := conns[:0]
+		for _, sub := range conns {
+			if sub.clientID() != c.clientid || sub.filter != topic {
+				out = append(out, sub)
+			}
+		}
+		if len(out) == 0 {
+			delete(s.subs, filter)
+		} else {
+			s.subs[filter] = out
 		}
 	}
 	s.mu.Unlock()
@@ -481,7 +857,6 @@ func (s *subscriptions) run(id int) {
 		// original PUBLISH arrived, the Retain flag should not be set,
 		// regardless of the Retain flag of the original PUBLISH.
 		isRetain := post.m.Header.Retain
-		post.m.Header.Retain = false
 
 		// Handle "retain with payload size zero = delete retain".
 		// Once the delete is done, return instead of continuing.
@@ -494,14 +869,35 @@ func (s *subscriptions) run(id int) {
 		// Find all the connections that should be notified of this message.
 		conns := s.subscribers(post.m.TopicName)
 		// Queue the outgoing messages
-		for _, c := range conns {
-			// Do not echo messages back to where they came from.
-			if c == post.c {
+		for _, sub := range conns {
+			if sub.c == post.c && sub.noLocal {
 				continue
 			}
 
-			if c != nil {
-				c.submit(post.m)
+			out := *post.m
+			if out.QosLevel > sub.qos {
+				out.QosLevel = sub.qos
+			}
+			if !sub.retainAsPublished {
+				out.Retain = false
+			}
+			if sub.c != nil {
+				if out.QosLevel.HasId() {
+					out.MessageId = sub.c.nextMessageID()
+				} else {
+					out.MessageId = 0
+				}
+				storedID := uint64(0)
+				if sub.session != nil && sub.c.persistent && out.QosLevel > proto.QosAtMostOnce {
+					if stored, ok := storedPublish(&out); ok {
+						storedID = sub.session.server.queueSession(sub.session, stored)
+					}
+				}
+				sub.c.trackAndSubmit(&out, storedID)
+			} else if sub.session != nil && out.QosLevel > proto.QosAtMostOnce && sub.session.server.sessionActive(sub.session) {
+				if stored, ok := storedPublish(&out); ok {
+					_ = sub.session.server.queueSession(sub.session, stored)
+				}
 			}
 		}
 
@@ -529,13 +925,29 @@ func isWildcard(topic string) bool {
 	return false
 }
 
+func parseSharedFilter(filter string) (group, inner string, valid bool) {
+	if !strings.HasPrefix(filter, "$share/") {
+		return "", filter, true
+	}
+	rest := strings.TrimPrefix(filter, "$share/")
+	slash := strings.IndexByte(rest, '/')
+	if slash <= 0 || slash == len(rest)-1 {
+		return "", "", false
+	}
+	group, inner = rest[:slash], rest[slash+1:]
+	if strings.ContainsAny(group, "+#") || strings.HasPrefix(inner, "$share/") {
+		return "", "", false
+	}
+	return group, inner, true
+}
+
 type wild struct {
 	wild []string
-	c    *incomingConn
+	sub  subscription
 }
 
 func newWild(topic string, c *incomingConn) wild {
-	return wild{wild: strings.Split(topic, "/"), c: c}
+	return wild{wild: strings.Split(topic, "/"), sub: subscription{c: c}}
 }
 
 func (w wild) matches(parts []string) bool {
@@ -600,7 +1012,16 @@ func (ip intPayload) Size() int {
 	return len(ip)
 }
 
-var clients = make(map[string]*incomingConn)
+func (c *incomingConn) nextMessageID() uint16 {
+	c.idMu.Lock()
+	defer c.idMu.Unlock()
+	id := c.nextID
+	c.nextID++
+	if c.nextID == 0 {
+		c.nextID = 1
+	}
+	return id
+}
 
 type stats struct {
 	recv       int64

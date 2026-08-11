@@ -1,4 +1,5 @@
-// Implementation of MQTT V3.1 encoding and decoding.
+// Package proto implements streaming MQTT 3.1.1 and MQTT 5.0 packet encoding
+// and decoding. Broker and client semantics live in the mqtt package.
 //
 // See http://public.dhe.ibm.com/software/dw/webservices/ws-mqtt/mqtt-v3r1.html
 // for the MQTT protocol specification. This package does not implement the
@@ -120,7 +121,7 @@ const (
 type ReturnCode uint8
 
 func (rc ReturnCode) IsValid() bool {
-	return rc >= RetCodeAccepted && rc < retCodeFirstInvalid
+	return rc >= RetCodeAccepted && rc <= RetCodeNotAuthorized
 }
 
 // DecoderConfig provides configuration for decoding messages.
@@ -130,6 +131,42 @@ type DecoderConfig interface {
 	// payload. The Payload.ReadPayload method is called on the returned payload
 	// by the decoding process.
 	MakePayload(msg *Publish, r io.Reader, n int) (Payload, error)
+}
+
+// VersionedDecoderConfig optionally tells the decoder which wire format to
+// use after CONNECT. MQTT 5 adds a properties field to most packets, so the
+// protocol level must be carried by the connection.
+type VersionedDecoderConfig interface {
+	DecoderConfig
+	MQTTVersion() ProtocolVersion
+}
+
+// DecodeOptions is the standard decoder configuration. Version defaults to
+// Version311 when left unset, preserving the behaviour of older callers.
+type DecodeOptions struct {
+	Version        ProtocolVersion
+	PayloadFactory func(*Publish, io.Reader, int) (Payload, error)
+}
+
+func (o *DecodeOptions) MQTTVersion() ProtocolVersion {
+	if o == nil || o.Version == 0 {
+		return Version311
+	}
+	return o.Version
+}
+
+func (o *DecodeOptions) MakePayload(msg *Publish, r io.Reader, n int) (Payload, error) {
+	if o != nil && o.PayloadFactory != nil {
+		return o.PayloadFactory(msg, r, n)
+	}
+	return make(BytesPayload, n), nil
+}
+
+func decoderVersion(c DecoderConfig) ProtocolVersion {
+	if c, ok := c.(VersionedDecoderConfig); ok {
+		return c.MQTTVersion()
+	}
+	return Version311
 }
 
 type DefaultDecoderConfig struct{}
@@ -158,6 +195,9 @@ func DecodeOneMessage(r io.Reader, config DecoderConfig) (msg Message, err error
 	if err != nil {
 		return
 	}
+	if err = validateFixedHeader(msgType, hdr); err != nil {
+		return nil, err
+	}
 
 	msg, err = NewMessage(msgType)
 	if err != nil {
@@ -169,6 +209,25 @@ func DecodeOneMessage(r io.Reader, config DecoderConfig) (msg Message, err error
 	}
 
 	return msg, msg.Decode(r, hdr, packetRemaining, config)
+}
+
+func validateFixedHeader(mt MessageType, h Header) error {
+	if mt == MsgPublish {
+		if h.QosLevel == qosFirstInvalid || (h.QosLevel == QosAtMostOnce && h.DupFlag) {
+			return badQosError
+		}
+		return nil
+	}
+	if mt == MsgPubRel || mt == MsgSubscribe || mt == MsgUnsubscribe {
+		if !h.DupFlag && h.QosLevel == QosAtLeastOnce && !h.Retain {
+			return nil
+		}
+		return errors.New("mqtt: invalid fixed header flags")
+	}
+	if h.DupFlag || h.QosLevel != QosAtMostOnce || h.Retain {
+		return errors.New("mqtt: invalid fixed header flags")
+	}
+	return nil
 }
 
 // NewMessage creates an instance of a Message value for the given message
@@ -203,11 +262,49 @@ func NewMessage(msgType MessageType) (msg Message, err error) {
 		msg = new(PingResp)
 	case MsgDisconnect:
 		msg = new(Disconnect)
+	case MsgAuth:
+		msg = new(Auth)
 	default:
 		return nil, badMsgTypeError
 	}
 
 	return
+}
+
+// SetVersion marks a packet for the requested wire format. CONNECT carries
+// its own protocol level; all other MQTT 5 packets need this connection-level
+// context when encoded.
+func SetVersion(msg Message, version ProtocolVersion) {
+	switch m := msg.(type) {
+	case *ConnAck:
+		m.Header.Version = version
+	case *Publish:
+		m.Header.Version = version
+	case *PubAck:
+		m.Header.Version = version
+	case *PubRec:
+		m.Header.Version = version
+	case *PubRel:
+		m.Header.Version = version
+	case *PubComp:
+		m.Header.Version = version
+	case *Subscribe:
+		m.Header.Version = version
+	case *SubAck:
+		m.Header.Version = version
+	case *Unsubscribe:
+		m.Header.Version = version
+	case *UnsubAck:
+		m.Header.Version = version
+	case *PingReq:
+		m.Header.Version = version
+	case *PingResp:
+		m.Header.Version = version
+	case *Disconnect:
+		m.Header.Version = version
+	case *Auth:
+		m.Header.Version = version
+	}
 }
 
 // panicErr wraps an error that caused a problem that needs to bail out of the

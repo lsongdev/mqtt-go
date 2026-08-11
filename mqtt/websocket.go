@@ -22,6 +22,7 @@ type WebSocketConn struct {
 	readTimeout time.Duration
 	readBuf     bytes.Buffer // 添加缓冲区用于合并消息
 	mu          sync.Mutex   // 保护并发访问
+	writeMu     sync.Mutex
 }
 
 // wsUpgrader specifies parameters for upgrading an HTTP connection to a WebSocket connection
@@ -131,6 +132,8 @@ func (w *WebSocketConn) Read(p []byte) (n int, err error) {
 
 // Write implements io.Writer interface
 func (w *WebSocketConn) Write(p []byte) (n int, err error) {
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
 	writer, err := w.NextWriter(websocket.BinaryMessage)
 	if err != nil {
 		closeErr, ok := err.(*websocket.CloseError)
@@ -199,7 +202,7 @@ func (w *WebSocketConn) Close() error {
 		if err != nil {
 			log.Printf("WebSocket: Failed to send close frame to %s: %v", w.RemoteAddr(), err)
 		}
-		err = w.Close()
+		err = w.Conn.Close()
 		log.Printf("WebSocket: Connection closed for %s", w.RemoteAddr())
 	})
 	return err

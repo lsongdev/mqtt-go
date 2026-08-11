@@ -18,6 +18,10 @@ var ConnectionErrors = [6]error{
 	errors.New("connection refused: not authorized"),
 }
 
+// ErrClientClosed is returned when an operation cannot complete because the
+// client transport has closed.
+var ErrClientClosed = errors.New("mqtt: client connection closed")
+
 type retainFlag bool
 type dupFlag bool
 
@@ -43,10 +47,10 @@ type job struct {
 	r receipt
 }
 
-type receipt chan struct{}
+type receipt chan error
 
 // Wait for the receipt to indicate that the job is done.
-func (r receipt) wait() {
+func (r receipt) wait() error {
 	// TODO: timeout
-	<-r
+	return <-r
 }

@@ -17,11 +17,30 @@ const (
 	PROTOCOL_5_0   = "MQTT"
 )
 
+// ProtocolVersion is the MQTT protocol level placed in CONNECT.
+type ProtocolVersion uint8
+type ReasonCode uint8
+
+const (
+	Version311 ProtocolVersion = 4
+	Version5   ProtocolVersion = 5
+)
+
 // Header contains the common attributes of all messages. Some attributes are
 // not applicable to some message types.
 type Header struct {
 	DupFlag, Retain bool
 	QosLevel        QosLevel
+	// Version selects the wire format for packets other than CONNECT. The zero
+	// value means MQTT 3.1.1 for backwards compatibility.
+	Version ProtocolVersion
+}
+
+func (hdr Header) protocolVersion() ProtocolVersion {
+	if hdr.Version == 0 {
+		return Version311
+	}
+	return hdr.Version
 }
 
 func (hdr *Header) Encode(w io.Writer, msgType MessageType, remainingLength int32) error {
@@ -40,6 +59,9 @@ func (hdr *Header) encodeInto(buf *bytes.Buffer, msgType MessageType, remainingL
 	}
 	if !msgType.IsValid() {
 		return badMsgTypeError
+	}
+	if err := validateFixedHeader(msgType, *hdr); err != nil {
+		return err
 	}
 
 	val := byte(msgType) << 4
@@ -63,11 +85,11 @@ func (hdr *Header) Decode(r io.Reader) (msgType MessageType, remainingLength int
 	}
 
 	byte1 := buf[0]
-	msgType = MessageType(byte1 & 0xF0 >> 4)
+	msgType = MessageType((byte1 & 0xF0) >> 4)
 
 	*hdr = Header{
 		DupFlag:  byte1&0x08 > 0,
-		QosLevel: QosLevel(byte1 & 0x06 >> 1),
+		QosLevel: QosLevel((byte1 & 0x06) >> 1),
 		Retain:   byte1&0x01 > 0,
 	}
 
@@ -103,6 +125,7 @@ const (
 	MsgPingReq
 	MsgPingResp
 	MsgDisconnect
+	MsgAuth
 
 	msgTypeFirstInvalid
 )
@@ -146,12 +169,17 @@ type Connect struct {
 	WillTopic, WillMessage     string
 	UsernameFlag, PasswordFlag bool
 	Username, Password         string
-	ReservedBit                byte // Added from 3.1.1
+	ReservedBit                byte       // Added from 3.1.1
+	Properties                 Properties // MQTT 5 CONNECT properties.
+	WillProperties             Properties // MQTT 5 will properties.
 }
 
 func (msg *Connect) Encode(w io.Writer) (err error) {
 	if !msg.WillQos.IsValid() {
 		return badWillQosError
+	}
+	if err := validateProtocolVersion(msg); err != nil {
+		return err
 	}
 
 	buf := new(bytes.Buffer)
@@ -167,8 +195,18 @@ func (msg *Connect) Encode(w io.Writer) (err error) {
 	setUint8(msg.ProtocolVersion, buf)
 	buf.WriteByte(flags)
 	setUint16(msg.KeepAliveTimer, buf)
+	if ProtocolVersion(msg.ProtocolVersion) == Version5 {
+		if err := encodeProperties(buf, msg.Properties); err != nil {
+			return err
+		}
+	}
 	setString(msg.ClientId, buf)
 	if msg.WillFlag {
+		if ProtocolVersion(msg.ProtocolVersion) == Version5 {
+			if err := encodeProperties(buf, msg.WillProperties); err != nil {
+				return err
+			}
+		}
 		setString(msg.WillTopic, buf)
 		setString(msg.WillMessage, buf)
 	}
@@ -193,9 +231,8 @@ func (msg *Connect) Decode(r io.Reader, hdr Header, packetRemaining int32, confi
 	protocolVersion := getUint8(r, &packetRemaining)
 	flags := getUint8(r, &packetRemaining)
 	keepAliveTimer := getUint16(r, &packetRemaining)
-	clientId := getString(r, &packetRemaining)
-
 	*msg = Connect{
+		Header:          Header{Version: ProtocolVersion(protocolVersion)},
 		ProtocolName:    protocolName,
 		ProtocolVersion: protocolVersion,
 		UsernameFlag:    flags&0x80 > 0,
@@ -204,11 +241,18 @@ func (msg *Connect) Decode(r io.Reader, hdr Header, packetRemaining int32, confi
 		WillQos:         QosLevel(flags & 0x18 >> 3),
 		WillFlag:        flags&0x04 > 0,
 		CleanSession:    flags&0x02 > 0,
+		ReservedBit:     flags & 0x01,
 		KeepAliveTimer:  keepAliveTimer,
-		ClientId:        clientId,
 	}
+	if ProtocolVersion(protocolVersion) == Version5 {
+		msg.Properties = decodeProperties(r, &packetRemaining)
+	}
+	msg.ClientId = getString(r, &packetRemaining)
 
 	if msg.WillFlag {
+		if ProtocolVersion(protocolVersion) == Version5 {
+			msg.WillProperties = decodeProperties(r, &packetRemaining)
+		}
 		msg.WillTopic = getString(r, &packetRemaining)
 		msg.WillMessage = getString(r, &packetRemaining)
 	}
@@ -235,6 +279,7 @@ type ConnAck struct {
 	Header
 	SessionPresent bool
 	ReturnCode     ReturnCode
+	Properties     Properties
 }
 
 func (msg *ConnAck) Encode(w io.Writer) (err error) {
@@ -243,6 +288,11 @@ func (msg *ConnAck) Encode(w io.Writer) (err error) {
 	flags := 0x1 & boolToByte(msg.SessionPresent)
 	buf.WriteByte(flags)
 	setUint8(uint8(msg.ReturnCode), buf)
+	if msg.Header.protocolVersion() == Version5 {
+		if err := encodeProperties(buf, msg.Properties); err != nil {
+			return err
+		}
+	}
 
 	return writeMessage(w, MsgConnAck, &msg.Header, buf, 0)
 }
@@ -253,11 +303,15 @@ func (msg *ConnAck) Decode(r io.Reader, hdr Header, packetRemaining int32, confi
 	}()
 
 	msg.Header = hdr
+	msg.Header.Version = decoderVersion(config)
 
 	msg.SessionPresent = (getUint8(r, &packetRemaining) & 0x01) > 0
 	msg.ReturnCode = ReturnCode(getUint8(r, &packetRemaining))
-	if !msg.ReturnCode.IsValid() {
+	if msg.Header.protocolVersion() != Version5 && !msg.ReturnCode.IsValid() {
 		return badReturnCodeError
+	}
+	if msg.Header.protocolVersion() == Version5 {
+		msg.Properties = decodeProperties(r, &packetRemaining)
 	}
 
 	if packetRemaining != 0 {
@@ -270,24 +324,34 @@ func (msg *ConnAck) Decode(r io.Reader, hdr Header, packetRemaining int32, confi
 // Publish represents an MQTT PUBLISH message.
 type Publish struct {
 	Header
-	TopicName string
-	MessageId uint16
-	Payload   Payload
+	TopicName  string
+	MessageId  uint16
+	Payload    Payload
+	Properties Properties
 }
 
 func (msg *Publish) Encode(w io.Writer) (err error) {
 	buf := new(bytes.Buffer)
+	payload := msg.Payload
+	if payload == nil {
+		payload = BytesPayload(nil)
+	}
 
 	setString(msg.TopicName, buf)
 	if msg.Header.QosLevel.HasId() {
 		setUint16(msg.MessageId, buf)
 	}
+	if msg.Header.protocolVersion() == Version5 {
+		if err = encodeProperties(buf, msg.Properties); err != nil {
+			return err
+		}
+	}
 
-	if err = writeMessage(w, MsgPublish, &msg.Header, buf, int32(msg.Payload.Size())); err != nil {
+	if err = writeMessage(w, MsgPublish, &msg.Header, buf, int32(payload.Size())); err != nil {
 		return
 	}
 
-	return msg.Payload.WritePayload(w)
+	return payload.WritePayload(w)
 }
 
 func (msg *Publish) Decode(r io.Reader, hdr Header, packetRemaining int32, config DecoderConfig) (err error) {
@@ -296,13 +360,17 @@ func (msg *Publish) Decode(r io.Reader, hdr Header, packetRemaining int32, confi
 	}()
 
 	msg.Header = hdr
+	msg.Header.Version = decoderVersion(config)
 
 	msg.TopicName = getString(r, &packetRemaining)
 	if msg.Header.QosLevel.HasId() {
 		msg.MessageId = getUint16(r, &packetRemaining)
 	}
+	if msg.Header.protocolVersion() == Version5 {
+		msg.Properties = decodeProperties(r, &packetRemaining)
+	}
 
-	payloadReader := &io.LimitedReader{r, int64(packetRemaining)}
+	payloadReader := &io.LimitedReader{R: r, N: int64(packetRemaining)}
 
 	if msg.Payload, err = config.MakePayload(msg, payloadReader, int(packetRemaining)); err != nil {
 		return
@@ -314,86 +382,111 @@ func (msg *Publish) Decode(r io.Reader, hdr Header, packetRemaining int32, confi
 // PubAck represents an MQTT PUBACK message.
 type PubAck struct {
 	Header
-	MessageId uint16
+	MessageId  uint16
+	ReasonCode ReasonCode
+	Properties Properties
 }
 
 func (msg *PubAck) Encode(w io.Writer) error {
-	return encodeAckCommon(w, &msg.Header, msg.MessageId, MsgPubAck)
+	return encodeAckCommon(w, &msg.Header, msg.MessageId, msg.ReasonCode, msg.Properties, MsgPubAck)
 }
 
 func (msg *PubAck) Decode(r io.Reader, hdr Header, packetRemaining int32, config DecoderConfig) (err error) {
 	msg.Header = hdr
-	return decodeAckCommon(r, packetRemaining, &msg.MessageId, config)
+	return decodeAckCommon(r, hdr, packetRemaining, &msg.MessageId, &msg.ReasonCode, &msg.Properties, config)
 }
 
 // PubRec represents an MQTT PUBREC message.
 type PubRec struct {
 	Header
-	MessageId uint16
+	MessageId  uint16
+	ReasonCode ReasonCode
+	Properties Properties
 }
 
 func (msg *PubRec) Encode(w io.Writer) error {
-	return encodeAckCommon(w, &msg.Header, msg.MessageId, MsgPubRec)
+	return encodeAckCommon(w, &msg.Header, msg.MessageId, msg.ReasonCode, msg.Properties, MsgPubRec)
 }
 
 func (msg *PubRec) Decode(r io.Reader, hdr Header, packetRemaining int32, config DecoderConfig) (err error) {
 	msg.Header = hdr
-	return decodeAckCommon(r, packetRemaining, &msg.MessageId, config)
+	return decodeAckCommon(r, hdr, packetRemaining, &msg.MessageId, &msg.ReasonCode, &msg.Properties, config)
 }
 
 // PubRel represents an MQTT PUBREL message.
 type PubRel struct {
 	Header
-	MessageId uint16
+	MessageId  uint16
+	ReasonCode ReasonCode
+	Properties Properties
 }
 
 func (msg *PubRel) Encode(w io.Writer) error {
-	return encodeAckCommon(w, &msg.Header, msg.MessageId, MsgPubRel)
+	h := msg.Header
+	h.QosLevel = QosAtLeastOnce
+	return encodeAckCommon(w, &h, msg.MessageId, msg.ReasonCode, msg.Properties, MsgPubRel)
 }
 
 func (msg *PubRel) Decode(r io.Reader, hdr Header, packetRemaining int32, config DecoderConfig) (err error) {
 	msg.Header = hdr
-	return decodeAckCommon(r, packetRemaining, &msg.MessageId, config)
+	return decodeAckCommon(r, hdr, packetRemaining, &msg.MessageId, &msg.ReasonCode, &msg.Properties, config)
 }
 
 // PubComp represents an MQTT PUBCOMP message.
 type PubComp struct {
 	Header
-	MessageId uint16
+	MessageId  uint16
+	ReasonCode ReasonCode
+	Properties Properties
 }
 
 func (msg *PubComp) Encode(w io.Writer) error {
-	return encodeAckCommon(w, &msg.Header, msg.MessageId, MsgPubComp)
+	return encodeAckCommon(w, &msg.Header, msg.MessageId, msg.ReasonCode, msg.Properties, MsgPubComp)
 }
 
 func (msg *PubComp) Decode(r io.Reader, hdr Header, packetRemaining int32, config DecoderConfig) (err error) {
 	msg.Header = hdr
-	return decodeAckCommon(r, packetRemaining, &msg.MessageId, config)
+	return decodeAckCommon(r, hdr, packetRemaining, &msg.MessageId, &msg.ReasonCode, &msg.Properties, config)
 }
 
 // Subscribe represents an MQTT SUBSCRIBE message.
 type Subscribe struct {
 	Header
-	MessageId uint16
-	Topics    []TopicQos
+	MessageId  uint16
+	Topics     []TopicQos
+	Properties Properties
 }
 
 type TopicQos struct {
-	Topic string
-	Qos   QosLevel
+	Topic             string
+	Qos               QosLevel
+	NoLocal           bool
+	RetainAsPublished bool
+	RetainHandling    byte
 }
 
 func (msg *Subscribe) Encode(w io.Writer) (err error) {
 	buf := new(bytes.Buffer)
-	if msg.Header.QosLevel.HasId() {
-		setUint16(msg.MessageId, buf)
+	setUint16(msg.MessageId, buf)
+	if msg.Header.protocolVersion() == Version5 {
+		if err := encodeProperties(buf, msg.Properties); err != nil {
+			return err
+		}
 	}
 	for _, topicSub := range msg.Topics {
+		if !topicSub.Qos.IsValid() || topicSub.RetainHandling > 2 {
+			return errors.New("mqtt: invalid subscription options")
+		}
 		setString(topicSub.Topic, buf)
-		setUint8(uint8(topicSub.Qos), buf)
+		options := uint8(topicSub.Qos)
+		if msg.Header.protocolVersion() == Version5 {
+			options |= boolToByte(topicSub.NoLocal)<<2 | boolToByte(topicSub.RetainAsPublished)<<3 | (topicSub.RetainHandling&3)<<4
+		}
+		setUint8(options, buf)
 	}
-
-	return writeMessage(w, MsgSubscribe, &msg.Header, buf, 0)
+	h := msg.Header
+	h.QosLevel = QosAtLeastOnce
+	return writeMessage(w, MsgSubscribe, &h, buf, 0)
 }
 
 func (msg *Subscribe) Decode(r io.Reader, hdr Header, packetRemaining int32, config DecoderConfig) (err error) {
@@ -402,15 +495,22 @@ func (msg *Subscribe) Decode(r io.Reader, hdr Header, packetRemaining int32, con
 	}()
 
 	msg.Header = hdr
+	msg.Header.Version = decoderVersion(config)
 
-	if msg.Header.QosLevel.HasId() {
-		msg.MessageId = getUint16(r, &packetRemaining)
+	msg.MessageId = getUint16(r, &packetRemaining)
+	if msg.Header.protocolVersion() == Version5 {
+		msg.Properties = decodeProperties(r, &packetRemaining)
 	}
 	var topics []TopicQos
 	for packetRemaining > 0 {
+		topic := getString(r, &packetRemaining)
+		options := getUint8(r, &packetRemaining)
+		if options&0xc0 != 0 || QosLevel(options&3) == qosFirstInvalid || (msg.Header.protocolVersion() == Version5 && (options>>4)&3 == 3) || (msg.Header.protocolVersion() != Version5 && options&0xfc != 0) {
+			return errors.New("mqtt: invalid subscription options")
+		}
 		topics = append(topics, TopicQos{
-			Topic: getString(r, &packetRemaining),
-			Qos:   QosLevel(getUint8(r, &packetRemaining)),
+			Topic: topic, Qos: QosLevel(options & 3), NoLocal: options&4 != 0,
+			RetainAsPublished: options&8 != 0, RetainHandling: (options >> 4) & 3,
 		})
 	}
 	msg.Topics = topics
@@ -421,15 +521,26 @@ func (msg *Subscribe) Decode(r io.Reader, hdr Header, packetRemaining int32, con
 // SubAck represents an MQTT SUBACK message.
 type SubAck struct {
 	Header
-	MessageId uint16
-	TopicsQos []QosLevel
+	MessageId   uint16
+	TopicsQos   []QosLevel
+	ReasonCodes []ReasonCode
+	Properties  Properties
 }
 
 func (msg *SubAck) Encode(w io.Writer) (err error) {
 	buf := new(bytes.Buffer)
 	setUint16(msg.MessageId, buf)
-	for i := 0; i < len(msg.TopicsQos); i += 1 {
-		setUint8(uint8(msg.TopicsQos[i]), buf)
+	if msg.Header.protocolVersion() == Version5 {
+		if err := encodeProperties(buf, msg.Properties); err != nil {
+			return err
+		}
+		for _, reason := range msg.ReasonCodes {
+			setUint8(uint8(reason), buf)
+		}
+	} else {
+		for _, qos := range msg.TopicsQos {
+			setUint8(uint8(qos), buf)
+		}
 	}
 
 	return writeMessage(w, MsgSubAck, &msg.Header, buf, 0)
@@ -441,11 +552,19 @@ func (msg *SubAck) Decode(r io.Reader, hdr Header, packetRemaining int32, config
 	}()
 
 	msg.Header = hdr
+	msg.Header.Version = decoderVersion(config)
 
 	msg.MessageId = getUint16(r, &packetRemaining)
+	if msg.Header.protocolVersion() == Version5 {
+		msg.Properties = decodeProperties(r, &packetRemaining)
+		for packetRemaining > 0 {
+			msg.ReasonCodes = append(msg.ReasonCodes, ReasonCode(getUint8(r, &packetRemaining)))
+		}
+		return nil
+	}
 	topicsQos := make([]QosLevel, 0)
 	for packetRemaining > 0 {
-		grantedQos := QosLevel(getUint8(r, &packetRemaining) & 0x03)
+		grantedQos := QosLevel(getUint8(r, &packetRemaining))
 		topicsQos = append(topicsQos, grantedQos)
 	}
 	msg.TopicsQos = topicsQos
@@ -456,20 +575,26 @@ func (msg *SubAck) Decode(r io.Reader, hdr Header, packetRemaining int32, config
 // Unsubscribe represents an MQTT UNSUBSCRIBE message.
 type Unsubscribe struct {
 	Header
-	MessageId uint16
-	Topics    []string
+	MessageId  uint16
+	Topics     []string
+	Properties Properties
 }
 
 func (msg *Unsubscribe) Encode(w io.Writer) (err error) {
 	buf := new(bytes.Buffer)
-	if msg.Header.QosLevel.HasId() {
-		setUint16(msg.MessageId, buf)
+	setUint16(msg.MessageId, buf)
+	if msg.Header.protocolVersion() == Version5 {
+		if err := encodeProperties(buf, msg.Properties); err != nil {
+			return err
+		}
 	}
 	for _, topic := range msg.Topics {
 		setString(topic, buf)
 	}
 
-	return writeMessage(w, MsgUnsubscribe, &msg.Header, buf, 0)
+	h := msg.Header
+	h.QosLevel = QosAtLeastOnce
+	return writeMessage(w, MsgUnsubscribe, &h, buf, 0)
 }
 
 func (msg *Unsubscribe) Decode(r io.Reader, hdr Header, packetRemaining int32, config DecoderConfig) (err error) {
@@ -478,9 +603,11 @@ func (msg *Unsubscribe) Decode(r io.Reader, hdr Header, packetRemaining int32, c
 	}()
 
 	msg.Header = hdr
+	msg.Header.Version = decoderVersion(config)
 
-	if qos := msg.Header.QosLevel; qos == 1 || qos == 2 {
-		msg.MessageId = getUint16(r, &packetRemaining)
+	msg.MessageId = getUint16(r, &packetRemaining)
+	if msg.Header.protocolVersion() == Version5 {
+		msg.Properties = decodeProperties(r, &packetRemaining)
 	}
 	topics := make([]string, 0)
 	for packetRemaining > 0 {
@@ -494,16 +621,40 @@ func (msg *Unsubscribe) Decode(r io.Reader, hdr Header, packetRemaining int32, c
 // UnsubAck represents an MQTT UNSUBACK message.
 type UnsubAck struct {
 	Header
-	MessageId uint16
+	MessageId   uint16
+	ReasonCodes []ReasonCode
+	Properties  Properties
 }
 
 func (msg *UnsubAck) Encode(w io.Writer) error {
-	return encodeAckCommon(w, &msg.Header, msg.MessageId, MsgUnsubAck)
+	buf := new(bytes.Buffer)
+	setUint16(msg.MessageId, buf)
+	if msg.Header.protocolVersion() == Version5 {
+		if err := encodeProperties(buf, msg.Properties); err != nil {
+			return err
+		}
+		for _, reason := range msg.ReasonCodes {
+			setUint8(uint8(reason), buf)
+		}
+	}
+	return writeMessage(w, MsgUnsubAck, &msg.Header, buf, 0)
 }
 
 func (msg *UnsubAck) Decode(r io.Reader, hdr Header, packetRemaining int32, config DecoderConfig) (err error) {
 	msg.Header = hdr
-	return decodeAckCommon(r, packetRemaining, &msg.MessageId, config)
+	defer func() { err = recoverError(err, recover()) }()
+	msg.Header.Version = decoderVersion(config)
+	msg.MessageId = getUint16(r, &packetRemaining)
+	if msg.Header.protocolVersion() == Version5 {
+		msg.Properties = decodeProperties(r, &packetRemaining)
+		for packetRemaining > 0 {
+			msg.ReasonCodes = append(msg.ReasonCodes, ReasonCode(getUint8(r, &packetRemaining)))
+		}
+	}
+	if packetRemaining != 0 {
+		return msgTooLongError
+	}
+	return nil
 }
 
 // PingReq represents an MQTT PINGREQ message.
@@ -541,34 +692,111 @@ func (msg *PingResp) Decode(r io.Reader, hdr Header, packetRemaining int32, conf
 // Disconnect represents an MQTT DISCONNECT message.
 type Disconnect struct {
 	Header
+	ReasonCode ReasonCode
+	Properties Properties
 }
 
 func (msg *Disconnect) Encode(w io.Writer) error {
-	return msg.Header.Encode(w, MsgDisconnect, 0)
+	if msg.Header.protocolVersion() != Version5 || (msg.ReasonCode == 0 && len(msg.Properties) == 0) {
+		return msg.Header.Encode(w, MsgDisconnect, 0)
+	}
+	buf := new(bytes.Buffer)
+	setUint8(uint8(msg.ReasonCode), buf)
+	if err := encodeProperties(buf, msg.Properties); err != nil {
+		return err
+	}
+	return writeMessage(w, MsgDisconnect, &msg.Header, buf, 0)
 }
 
-func (msg *Disconnect) Decode(r io.Reader, hdr Header, packetRemaining int32, config DecoderConfig) error {
+func (msg *Disconnect) Decode(r io.Reader, hdr Header, packetRemaining int32, config DecoderConfig) (err error) {
+	msg.Header = hdr
+	msg.Header.Version = decoderVersion(config)
+	if msg.Header.protocolVersion() != Version5 {
+		if packetRemaining != 0 {
+			return msgTooLongError
+		}
+		return nil
+	}
+	if packetRemaining == 0 {
+		return nil
+	}
+	defer func() { err = recoverError(err, recover()) }()
+	msg.ReasonCode = ReasonCode(getUint8(r, &packetRemaining))
+	if packetRemaining > 0 {
+		msg.Properties = decodeProperties(r, &packetRemaining)
+	}
 	if packetRemaining != 0 {
 		return msgTooLongError
 	}
-	// set hdr for Disconnct to validate
-	// reserved bits for the Flags
-	msg.Header = hdr
 	return nil
 }
 
-func encodeAckCommon(w io.Writer, hdr *Header, messageId uint16, msgType MessageType) error {
+// Auth represents the MQTT 5 AUTH packet used for extended authentication.
+type Auth struct {
+	Header
+	ReasonCode ReasonCode
+	Properties Properties
+}
+
+func (msg *Auth) Encode(w io.Writer) error {
+	if msg.Header.protocolVersion() != Version5 {
+		return errors.New("mqtt: AUTH requires MQTT 5")
+	}
+	if msg.ReasonCode == 0 && len(msg.Properties) == 0 {
+		return msg.Header.Encode(w, MsgAuth, 0)
+	}
+	buf := new(bytes.Buffer)
+	setUint8(uint8(msg.ReasonCode), buf)
+	if err := encodeProperties(buf, msg.Properties); err != nil {
+		return err
+	}
+	return writeMessage(w, MsgAuth, &msg.Header, buf, 0)
+}
+
+func (msg *Auth) Decode(r io.Reader, hdr Header, packetRemaining int32, config DecoderConfig) (err error) {
+	msg.Header = hdr
+	msg.Header.Version = decoderVersion(config)
+	if msg.Header.protocolVersion() != Version5 {
+		return errors.New("mqtt: AUTH requires MQTT 5")
+	}
+	if packetRemaining == 0 {
+		return nil
+	}
+	defer func() { err = recoverError(err, recover()) }()
+	msg.ReasonCode = ReasonCode(getUint8(r, &packetRemaining))
+	if packetRemaining > 0 {
+		msg.Properties = decodeProperties(r, &packetRemaining)
+	}
+	if packetRemaining != 0 {
+		return msgTooLongError
+	}
+	return nil
+}
+
+func encodeAckCommon(w io.Writer, hdr *Header, messageId uint16, reason ReasonCode, props Properties, msgType MessageType) error {
 	buf := new(bytes.Buffer)
 	setUint16(messageId, buf)
+	if hdr.protocolVersion() == Version5 && (reason != 0 || len(props) != 0) {
+		setUint8(uint8(reason), buf)
+		if err := encodeProperties(buf, props); err != nil {
+			return err
+		}
+	}
 	return writeMessage(w, msgType, hdr, buf, 0)
 }
 
-func decodeAckCommon(r io.Reader, packetRemaining int32, messageId *uint16, config DecoderConfig) (err error) {
+func decodeAckCommon(r io.Reader, hdr Header, packetRemaining int32, messageId *uint16, reason *ReasonCode, props *Properties, config DecoderConfig) (err error) {
 	defer func() {
 		err = recoverError(err, recover())
 	}()
 
 	*messageId = getUint16(r, &packetRemaining)
+	if decoderVersion(config) == Version5 && packetRemaining > 0 {
+		*reason = ReasonCode(getUint8(r, &packetRemaining))
+		if packetRemaining > 0 {
+			*props = decodeProperties(r, &packetRemaining)
+		}
+	}
 
 	if packetRemaining != 0 {
 		return msgTooLongError
@@ -591,30 +819,38 @@ func (msg *Connect) IsValidVersion() bool {
 }
 
 func (msg *Connect) Validate() error {
+	if !msg.IsValidVersion() {
+		return fmt.Errorf("unsupported protocol name/version: %q/%d", msg.ProtocolName, msg.ProtocolVersion)
+	}
 	if msg.ReservedBit != 0 {
 		return errors.New("connect reserved bit must be 0")
 	}
 	if len(msg.ClientId) == 0 && !msg.CleanSession {
 		return errors.New("empty client id requires clean session")
 	}
-	if msg.ProtocolVersion == 4 {
-		// 允许空 ClientId
-	} else if len(msg.ClientId) < 1 || len(msg.ClientId) > 23 {
+	if msg.ProtocolVersion == 3 && (len(msg.ClientId) < 1 || len(msg.ClientId) > 23) {
 		return errors.New("client id invalid length")
 	}
-	return nil
+	return validateProtocolVersion(msg)
 }
 
 func validateProtocolVersion(msg *Connect) error {
+	if !msg.IsValidVersion() {
+		return fmt.Errorf("unsupported protocol name/version: %q/%d", msg.ProtocolName, msg.ProtocolVersion)
+	}
 	switch msg.ProtocolVersion {
 	case 3: // MQTT 3.1
 		return validate31(msg)
 	case 4: // MQTT 3.1.1
 		return validate311(msg)
+	case 5:
+		return validate5(msg)
 	default:
 		return fmt.Errorf("unsupported protocol version: %d", msg.ProtocolVersion)
 	}
 }
+
+func validate5(msg Message) error { return validate311(msg) }
 
 func validate31(msg Message) error {
 	return nil
@@ -630,6 +866,15 @@ func validate311(msg Message) error {
 		// Will QoS 必须小于 3
 		if m.WillFlag && m.WillQos > 2 {
 			return errors.New("will QoS must be <= 2 in 3.1.1")
+		}
+		if !m.WillFlag && (m.WillRetain || m.WillQos != QosAtMostOnce) {
+			return errors.New("will retain and QoS require will flag")
+		}
+		if m.PasswordFlag && !m.UsernameFlag {
+			return errors.New("password flag requires username flag")
+		}
+		if len(m.ClientId) == 0 && !m.CleanSession {
+			return errors.New("empty client id requires clean start/session")
 		}
 
 	case *Publish:
