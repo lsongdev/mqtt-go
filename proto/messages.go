@@ -332,7 +332,11 @@ func (msg *ConnAck) Decode(r io.Reader, hdr Header, packetRemaining int32, confi
 	msg.Header = hdr
 	msg.Header.Version = decoderVersion(config)
 
-	msg.SessionPresent = (getUint8(r, &packetRemaining) & 0x01) > 0
+	ackFlags := getUint8(r, &packetRemaining)
+	if ackFlags&0xfe != 0 {
+		return errors.New("mqtt: CONNACK reserved acknowledge flags must be zero")
+	}
+	msg.SessionPresent = ackFlags&0x01 > 0
 	msg.ReturnCode = ReturnCode(getUint8(r, &packetRemaining))
 	if msg.SessionPresent && msg.ReturnCode != RetCodeAccepted {
 		return errors.New("mqtt: session present requires successful CONNACK")
@@ -968,6 +972,11 @@ func validate311(msg Message) error {
 		}
 		if !m.WillFlag && (m.WillRetain || m.WillQos != QosAtMostOnce) {
 			return errors.New("will retain and QoS require will flag")
+		}
+		if m.WillFlag {
+			if err := validateTopicName(m.WillTopic, false); err != nil {
+				return err
+			}
 		}
 		if m.PasswordFlag && !m.UsernameFlag {
 			return errors.New("password flag requires username flag")
