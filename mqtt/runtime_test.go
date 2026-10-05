@@ -211,3 +211,44 @@ func TestClientKeepAliveClosesWhenPingResponseIsMissing(t *testing.T) {
 	}
 	<-serverDone
 }
+
+
+func TestClientAcceptsAssignedV5ClientID(t *testing.T) {
+	server := NewServer()
+	defer server.Close()
+
+	serverSide, clientSide := net.Pipe()
+	server.ServeConn(serverSide)
+	client := NewClientConn(clientSide)
+	defer client.Close()
+
+	if err := client.ConnectWithOptions(ClientOptions{
+		ProtocolVersion: proto.Version5,
+		CleanStart:      true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if client.ClientId == "" {
+		t.Fatal("client did not retain broker-assigned client id")
+	}
+}
+
+func TestServerCloseClosesPreConnectTransport(t *testing.T) {
+	server := NewServer()
+	serverSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+	server.ServeConn(serverSide)
+
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = clientSide.SetReadDeadline(time.Now().Add(time.Second))
+	var one [1]byte
+	_, err := clientSide.Read(one[:])
+	if err == nil {
+		t.Fatal("pre-CONNECT transport remained open after Server.Close")
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatalf("Server.Close did not close pre-CONNECT transport: %v", err)
+	}
+}
