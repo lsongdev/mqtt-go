@@ -24,6 +24,7 @@ type Server struct {
 	Dump          bool          // When true, dump the messages in and out.
 	clientsMu     sync.Mutex
 	clients       map[string]*incomingConn
+	connections   map[*incomingConn]struct{}
 	options       ServerOptions
 	sessionsMu    sync.Mutex
 	sessions      map[string]*sessionState
@@ -66,6 +67,7 @@ func NewServerWithOptions(options ServerOptions) (*Server, error) {
 		subs:          newSubscriptions(),
 		stats:         &stats{},
 		clients:       make(map[string]*incomingConn),
+		connections:   make(map[*incomingConn]struct{}),
 		StatsInterval: time.Second * 10,
 		options:       options,
 		sessions:      make(map[string]*sessionState),
@@ -150,7 +152,16 @@ func (s *Server) Serve(listener net.Listener) error {
 
 // ServeConn hands an already-established transport to the broker.
 func (s *Server) ServeConn(conn net.Conn) {
+	select {
+	case <-s.Done:
+		_ = conn.Close()
+		return
+	default:
+	}
 	cli := s.newIncomingConn(conn)
+	s.clientsMu.Lock()
+	s.connections[cli] = struct{}{}
+	s.clientsMu.Unlock()
 	s.stats.clientConnect()
 	cli.start()
 }
@@ -162,8 +173,8 @@ func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.Done)
 		s.clientsMu.Lock()
-		connections := make([]net.Conn, 0, len(s.clients))
-		for _, client := range s.clients {
+		connections := make([]net.Conn, 0, len(s.connections))
+		for client := range s.connections {
 			connections = append(connections, client.conn)
 		}
 		s.clientsMu.Unlock()
@@ -229,6 +240,7 @@ func (c *incomingConn) del() {
 	if c.svr.clients[c.clientid] == c {
 		delete(c.svr.clients, c.clientid)
 	}
+	delete(c.svr.connections, c)
 	c.svr.clientsMu.Unlock()
 }
 
