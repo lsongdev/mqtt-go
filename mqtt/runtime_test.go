@@ -212,7 +212,6 @@ func TestClientKeepAliveClosesWhenPingResponseIsMissing(t *testing.T) {
 	<-serverDone
 }
 
-
 func TestClientAcceptsAssignedV5ClientID(t *testing.T) {
 	server := NewServer()
 	defer server.Close()
@@ -252,7 +251,6 @@ func TestServerCloseClosesPreConnectTransport(t *testing.T) {
 		t.Fatalf("Server.Close did not close pre-CONNECT transport: %v", err)
 	}
 }
-
 
 func TestServeConnAfterServerCloseClosesTransport(t *testing.T) {
 	server := NewServer()
