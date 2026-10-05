@@ -19,7 +19,13 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Format
-        run: test -z "$(gofmt -l .)"
+        run: |
+          files="$(gofmt -l .)"
+          if [ -n "$files" ]; then
+            echo "$files"
+            gofmt -d $files
+            exit 1
+          fi
       - name: Vet
         run: go vet ./...
       - name: Test
