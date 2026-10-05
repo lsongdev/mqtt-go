@@ -249,9 +249,9 @@ func (c *incomingConn) submit(m proto.Message) bool {
 	case <-c.closed:
 		return false
 	default:
-		// A full per-client queue means the peer is not keeping up. MQTT
-		// control packets cannot be dropped safely, so close the connection
-		// instead of silently corrupting the protocol state machine.
+		// MQTT control packets cannot be dropped safely. A full per-client
+		// queue therefore means the peer is too slow and the connection is
+		// closed instead of silently corrupting protocol state.
 		log.Print(c, ": outbound queue full; closing slow client")
 		c.stop()
 		return false
@@ -656,8 +656,8 @@ func newSubscriptions() *subscriptions {
 		posts:      make(chan post, postQueue),
 		roundRobin: make(map[string]uint64),
 	}
-	// A single dispatcher preserves MQTT ordered-topic delivery. Socket writes
-	// remain parallel because every connection owns its writer goroutine.
+	// One dispatcher preserves ordered-topic delivery. Socket writes remain
+	// parallel because each connection has its own writer goroutine.
 	go s.run()
 	return s
 }
@@ -823,8 +823,13 @@ func (s *subscriptions) subscribers(topic string) []subscription {
 	// process wildcards
 	parts := strings.Split(topic, "/")
 	for _, w := range s.wildcards {
-		// A Topic Filter that starts with a wildcard does not match Topic Names
-		// beginning with '			candidates = append(candidates, w.sub)
+		// A leading wildcard does not match Topic Names beginning with '$'.
+		// Shared subscriptions store the inner filter in w.wild.
+		if strings.HasPrefix(topic, "$") && (len(w.wild) == 0 || !strings.HasPrefix(w.wild[0], "$")) {
+			continue
+		}
+		if w.matches(parts) {
+			candidates = append(candidates, w.sub)
 		}
 	}
 	var subscribers []subscription
@@ -944,297 +949,6 @@ func (s *subscriptions) run() {
 		}
 
 		if isRetain && !deleteRetained {
-			s.mu.Lock()
-			// Save a copy of it, and set that copy's Retain to true, so that
-			// when we send it out later we notify new subscribers that this
-			// is an old message.
-			msg := *post.m
-			msg.Header.Retain = true
-			s.retain[post.m.TopicName] = retain{m: msg}
-			s.mu.Unlock()
-		}
-	}
-}
-
-func (s *subscriptions) submit(c *incomingConn, m *proto.Publish) {
-	s.posts <- post{c: c, m: m}
-}
-
-func isWildcard(topic string) bool {
-	if strings.Contains(topic, "#") || strings.Contains(topic, "+") {
-		return true
-	}
-	return false
-}
-
-func parseSharedFilter(filter string) (group, inner string, valid bool) {
-	if !strings.HasPrefix(filter, "$share/") {
-		return "", filter, true
-	}
-	rest := strings.TrimPrefix(filter, "$share/")
-	slash := strings.IndexByte(rest, '/')
-	if slash <= 0 || slash == len(rest)-1 {
-		return "", "", false
-	}
-	group, inner = rest[:slash], rest[slash+1:]
-	if strings.ContainsAny(group, "+#") || strings.HasPrefix(inner, "$share/") {
-		return "", "", false
-	}
-	return group, inner, true
-}
-
-type wild struct {
-	wild []string
-	sub  subscription
-}
-
-func newWild(topic string, c *incomingConn) wild {
-	return wild{wild: strings.Split(topic, "/"), sub: subscription{c: c}}
-}
-
-func (w wild) matches(parts []string) bool {
-	i := 0
-	for i < len(parts) {
-		// topic is longer, no match
-		if i >= len(w.wild) {
-			return false
-		}
-		// matched up to here, and now the wildcard says "all others will match"
-		if w.wild[i] == "#" {
-			return true
-		}
-		// text does not match, and there wasn't a + to excuse it
-		if parts[i] != w.wild[i] && w.wild[i] != "+" {
-			return false
-		}
-		i++
-	}
-
-	// make finance/stock/ibm/# match finance/stock/ibm
-	if i == len(w.wild)-1 && w.wild[len(w.wild)-1] == "#" {
-		return true
-	}
-
-	if i == len(w.wild) {
-		return true
-	}
-	return false
-}
-
-func (w wild) valid() bool {
-	for i, part := range w.wild {
-		// catch things like finance#
-		if isWildcard(part) && len(part) != 1 {
-			return false
-		}
-		// # can only occur as the last part
-		if part == "#" && i != len(w.wild)-1 {
-			return false
-		}
-	}
-	return true
-}
-
-// An intPayload implements proto.Payload, and is an int64 that
-// formats itself and then prints itself into the payload.
-type intPayload string
-
-func newIntPayload(i int64) intPayload {
-	return intPayload(fmt.Sprint(i))
-}
-func (ip intPayload) ReadPayload(r io.Reader) error {
-	// not implemented
-	return nil
-}
-func (ip intPayload) WritePayload(w io.Writer) error {
-	_, err := w.Write([]byte(string(ip)))
-	return err
-}
-func (ip intPayload) Size() int {
-	return len(ip)
-}
-
-func (c *incomingConn) nextMessageID() uint16 {
-	c.idMu.Lock()
-	defer c.idMu.Unlock()
-	id := c.nextID
-	c.nextID++
-	if c.nextID == 0 {
-		c.nextID = 1
-	}
-	return id
-}
-
-type stats struct {
-	recv       int64
-	sent       int64
-	clients    int64
-	clientsMax int64
-	lastmsgs   int64
-}
-
-func (s *stats) messageRecv()      { atomic.AddInt64(&s.recv, 1) }
-func (s *stats) messageSend()      { atomic.AddInt64(&s.sent, 1) }
-func (s *stats) clientConnect()    { atomic.AddInt64(&s.clients, 1) }
-func (s *stats) clientDisconnect() { atomic.AddInt64(&s.clients, -1) }
-
-func statsMessage(topic string, stat int64) *proto.Publish {
-	return &proto.Publish{
-		Header:    header(dupFalse, proto.QosAtMostOnce, retainTrue),
-		TopicName: topic,
-		Payload:   newIntPayload(stat),
-	}
-}
-
-func (s *stats) publish(sub *subscriptions, interval time.Duration) {
-	clients := atomic.LoadInt64(&s.clients)
-	clientsMax := atomic.LoadInt64(&s.clientsMax)
-	if clients > clientsMax {
-		clientsMax = clients
-		atomic.StoreInt64(&s.clientsMax, clientsMax)
-	}
-	sub.submit(nil, statsMessage("$SYS/broker/clients/active", clients))
-	sub.submit(nil, statsMessage("$SYS/broker/clients/maximum", clientsMax))
-	sub.submit(nil, statsMessage("$SYS/broker/messages/received",
-		atomic.LoadInt64(&s.recv)))
-	sub.submit(nil, statsMessage("$SYS/broker/messages/sent",
-		atomic.LoadInt64(&s.sent)))
-
-	msgs := atomic.LoadInt64(&s.recv) + atomic.LoadInt64(&s.sent)
-	msgpersec := (msgs - s.lastmsgs) / int64(interval/time.Second)
-	// no need for atomic because we are the only reader/writer of it
-	s.lastmsgs = msgs
-
-	sub.submit(nil, statsMessage("$SYS/broker/messages/per-sec", msgpersec))
-}
- (MQTT-4.7.2-1). Shared subscriptions keep the
-		// inner filter in w.wild, so the same rule applies naturally.
-		if strings.HasPrefix(topic, "$") && (len(w.wild) == 0 || !strings.HasPrefix(w.wild[0], "$")) {
-			continue
-		}
-		if w.matches(parts) {
-			candidates = append(candidates, w.sub)
-		}
-	}
-	var subscribers []subscription
-	groups := make(map[string][]subscription)
-	for _, sub := range candidates {
-		if sub.shareGroup == "" {
-			subscribers = append(subscribers, sub)
-		} else {
-			key := sub.shareGroup + "\x00" + sub.filter
-			groups[key] = append(groups[key], sub)
-		}
-	}
-	for key, list := range groups {
-		var online []subscription
-		for _, sub := range list {
-			if sub.c != nil {
-				online = append(online, sub)
-			}
-		}
-		if len(online) > 0 {
-			list = online
-		}
-		index := s.roundRobin[key] % uint64(len(list))
-		s.roundRobin[key]++
-		subscribers = append(subscribers, list[index])
-	}
-	return subscribers
-}
-
-// Remove all subscriptions that refer to a connection.
-func (s *subscriptions) unsubAll(c *incomingConn) {
-	s.detach(c, false)
-}
-
-// Remove the subscription to topic for a given connection.
-func (s *subscriptions) unsub(topic string, c *incomingConn) {
-	s.mu.Lock()
-	_, filter, _ := parseSharedFilter(topic)
-	if isWildcard(filter) {
-		filtered := s.wildcards[:0]
-		for _, w := range s.wildcards {
-			if w.sub.clientID() != c.clientid || w.sub.filter != topic {
-				filtered = append(filtered, w)
-			}
-		}
-		s.wildcards = filtered
-		s.mu.Unlock()
-		return
-	}
-	if conns, ok := s.subs[filter]; ok {
-		out := conns[:0]
-		for _, sub := range conns {
-			if sub.clientID() != c.clientid || sub.filter != topic {
-				out = append(out, sub)
-			}
-		}
-		if len(out) == 0 {
-			delete(s.subs, filter)
-		} else {
-			s.subs[filter] = out
-		}
-	}
-	s.mu.Unlock()
-}
-
-// The subscription processing worker.
-func (s *subscriptions) run(id int) {
-	tag := fmt.Sprintf("worker %d ", id)
-	log.Print(tag, "started")
-	for post := range s.posts {
-		// Remember the original retain setting, but send out immediate
-		// copies without retain: "When a server sends a PUBLISH to a client
-		// as a result of a subscription that already existed when the
-		// original PUBLISH arrived, the Retain flag should not be set,
-		// regardless of the Retain flag of the original PUBLISH.
-		isRetain := post.m.Header.Retain
-
-		// Handle "retain with payload size zero = delete retain".
-		// Once the delete is done, return instead of continuing.
-		if isRetain && post.m.Payload.Size() == 0 {
-			s.mu.Lock()
-			delete(s.retain, post.m.TopicName)
-			s.mu.Unlock()
-			return
-		}
-		// Find all the connections that should be notified of this message.
-		conns := s.subscribers(post.m.TopicName)
-		// Queue the outgoing messages
-		for _, sub := range conns {
-			if sub.c == post.c && sub.noLocal {
-				continue
-			}
-
-			out := *post.m
-			if out.QosLevel > sub.qos {
-				out.QosLevel = sub.qos
-			}
-			if !sub.retainAsPublished {
-				out.Retain = false
-			}
-			if sub.c != nil {
-				if out.QosLevel.HasId() {
-					out.MessageId = sub.c.nextMessageID()
-				} else {
-					out.MessageId = 0
-				}
-				storedID := uint64(0)
-				if sub.session != nil && sub.c.persistent && out.QosLevel > proto.QosAtMostOnce {
-					if stored, ok := storedPublish(&out); ok {
-						storedID = sub.session.server.queueSession(sub.session, stored)
-					}
-				}
-				sub.c.trackAndSubmit(&out, storedID)
-			} else if sub.session != nil && out.QosLevel > proto.QosAtMostOnce && sub.session.server.sessionActive(sub.session) {
-				if stored, ok := storedPublish(&out); ok {
-					_ = sub.session.server.queueSession(sub.session, stored)
-				}
-			}
-		}
-
-		if isRetain {
 			s.mu.Lock()
 			// Save a copy of it, and set that copy's Retain to true, so that
 			// when we send it out later we notify new subscribers that this
