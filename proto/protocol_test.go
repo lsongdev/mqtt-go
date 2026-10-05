@@ -106,18 +106,18 @@ func TestV4ControlPacketsRoundTrip(t *testing.T) {
 func TestAllPropertyWireTypesRoundTrip(t *testing.T) {
 	props := Properties{}.
 		Add(PropertyPayloadFormatIndicator, byte(1)).
-		Add(PropertyReceiveMaximum, uint16(10)).
-		Add(PropertySessionExpiryInterval, uint32(20)).
+		Add(PropertyTopicAlias, uint16(10)).
+		Add(PropertyMessageExpiryInterval, uint32(20)).
 		Add(PropertySubscriptionIdentifier, VarInt(321)).
 		Add(PropertyCorrelationData, []byte{1, 2, 3}).
 		Add(PropertyContentType, "text/plain").
 		Add(PropertyUser, StringPair{Key: "a", Value: "b"})
-	m := &Auth{Header: Header{Version: Version5}, ReasonCode: 0x18, Properties: props}
+	m := &Publish{Header: Header{Version: Version5}, TopicName: "a", Properties: props, Payload: BytesPayload("x")}
 	decoded, err := DecodeOneMessage(bytes.NewReader(encodePacket(t, m)), &DecodeOptions{Version: Version5})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(decoded.(*Auth).Properties, props) {
+	if !reflect.DeepEqual(decoded.(*Publish).Properties, props) {
 		t.Fatalf("properties: %#v", decoded)
 	}
 }
