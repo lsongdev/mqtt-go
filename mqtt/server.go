@@ -38,6 +38,7 @@ type ServerOptions struct {
 	EnablePersistentSessions  bool
 	EnableSharedSubscriptions bool
 	SessionStore              SessionStore
+	MaxPacketSize             int
 }
 
 func (s *Server) persistentSessionsEnabled() bool {
@@ -111,7 +112,7 @@ func (s *Server) newIncomingConn(conn net.Conn) *incomingConn {
 		svr:            s,
 		conn:           conn,
 		jobs:           make(chan job, sendingQueueLength),
-		decode:         &proto.DecodeOptions{Version: proto.Version311},
+		decode:         &proto.DecodeOptions{Version: proto.Version311, MaxPacketSize: s.options.MaxPacketSize},
 		version:        proto.Version311,
 		nextID:         1,
 		incomingQoS2:   make(map[uint16]*proto.Publish),
