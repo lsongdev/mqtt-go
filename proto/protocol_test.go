@@ -138,6 +138,26 @@ func TestRejectsNonCanonicalVariableByteInteger(t *testing.T) {
 	}
 }
 
+func TestRejectsReservedConnAckFlags(t *testing.T) {
+	if _, err := DecodeOneMessage(bytes.NewReader([]byte{0x20, 0x02, 0x02, 0x00}), nil); err == nil {
+		t.Fatal("accepted CONNACK with reserved acknowledge flags")
+	}
+}
+
+func TestRejectsInvalidWillTopicOnDecode(t *testing.T) {
+	packet := []byte{
+		0x10, 0x16,
+		0x00, 0x04, 'M', 'Q', 'T', 'T',
+		0x04, 0x06, 0x00, 0x00,
+		0x00, 0x01, 'c',
+		0x00, 0x05, 'b', 'a', 'd', '/', '+',
+		0x00, 0x00,
+	}
+	if _, err := DecodeOneMessage(bytes.NewReader(packet), nil); err == nil {
+		t.Fatal("accepted wildcard in Will Topic")
+	}
+}
+
 func TestRejectsMalformedFixedHeader(t *testing.T) {
 	// SUBSCRIBE must have flags 0b0010.
 	if _, err := DecodeOneMessage(bytes.NewReader([]byte{0x80, 0}), nil); err == nil {
