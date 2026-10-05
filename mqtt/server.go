@@ -190,7 +190,7 @@ type incomingConn struct {
 	decode         *proto.DecodeOptions
 	nextID         uint16
 	idMu           sync.Mutex
-	packetIDs       map[uint16]struct{}
+	packetIDs      map[uint16]struct{}
 	session        *sessionState
 	persistent     bool
 	incomingQoS2   map[uint16]*proto.Publish
