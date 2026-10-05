@@ -16,11 +16,10 @@ import (
 
 // A Server holds all the state associated with an MQTT server.
 type Server struct {
-	// l             net.Listener
 	subs          *subscriptions
 	stats         *stats
 	Done          chan struct{}
-	StatsInterval time.Duration // Defaults to 10 seconds. Must be set using sync/atomic.StoreInt64().
+	StatsInterval time.Duration // Defaults to 10 seconds.
 	Dump          bool          // When true, dump the messages in and out.
 	clientsMu     sync.Mutex
 	clients       map[string]*incomingConn
@@ -62,7 +61,6 @@ func NewServerWithOptions(options ServerOptions) (*Server, error) {
 		options.MaxPacketSize = DefaultMaxPacketSize
 	}
 	svr := &Server{
-		// l:             l,
 		Done:          make(chan struct{}),
 		subs:          newSubscriptions(),
 		stats:         &stats{},
@@ -941,8 +939,8 @@ func (s *subscriptions) run() {
 		// regardless of the Retain flag of the original PUBLISH.
 		isRetain := post.m.Header.Retain
 
-		// Handle "retain with payload size zero = delete retain".
-		// Once the delete is done, return instead of continuing.
+		// A retained PUBLISH with an empty payload clears the retained value,
+		// but the PUBLISH itself is still delivered to current subscribers.
 		deleteRetained := isRetain && post.m.Payload.Size() == 0
 		if deleteRetained {
 			s.mu.Lock()
