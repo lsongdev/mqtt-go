@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +27,7 @@ type Server struct {
 	options       ServerOptions
 	sessionsMu    sync.Mutex
 	sessions      map[string]*sessionState
+	clientSeq     uint64
 	closeOnce     sync.Once
 }
 
@@ -38,6 +38,7 @@ type ServerOptions struct {
 	EnablePersistentSessions  bool
 	EnableSharedSubscriptions bool
 	SessionStore              SessionStore
+	MaxPacketSize             int
 }
 
 func (s *Server) persistentSessionsEnabled() bool {
@@ -56,10 +57,13 @@ func NewServer() *Server {
 // NewServerWithOptions creates a broker with explicitly enabled optional
 // features. It restores unexpired sessions before accepting connections.
 func NewServerWithOptions(options ServerOptions) (*Server, error) {
+	if options.MaxPacketSize == 0 {
+		options.MaxPacketSize = DefaultMaxPacketSize
+	}
 	svr := &Server{
 		// l:             l,
 		Done:          make(chan struct{}),
-		subs:          newSubscriptions(runtime.GOMAXPROCS(0)),
+		subs:          newSubscriptions(),
 		stats:         &stats{},
 		clients:       make(map[string]*incomingConn),
 		StatsInterval: time.Second * 10,
@@ -111,21 +115,16 @@ func (s *Server) newIncomingConn(conn net.Conn) *incomingConn {
 		svr:            s,
 		conn:           conn,
 		jobs:           make(chan job, sendingQueueLength),
-		decode:         &proto.DecodeOptions{Version: proto.Version311},
+		decode:         &proto.DecodeOptions{Version: proto.Version311, MaxPacketSize: s.options.MaxPacketSize},
 		version:        proto.Version311,
 		nextID:         1,
 		incomingQoS2:   make(map[uint16]*proto.Publish),
 		outgoingQoS2:   make(map[uint16]*proto.Publish),
 		outgoingStored: make(map[uint16]uint64),
+		packetIDs:      make(map[uint16]struct{}),
+		closed:         make(chan struct{}),
 		done:           make(chan struct{}),
 	}
-}
-
-// Start makes the Server start accepting and handling connections.
-func (s *Server) Start() {
-	go func() {
-
-	}()
 }
 
 func ListenAndServe(addr string, server *Server) (err error) {
@@ -171,6 +170,7 @@ func (s *Server) Close() error {
 		for _, conn := range connections {
 			_ = conn.Close()
 		}
+		s.subs.close()
 	})
 	return nil
 }
@@ -187,12 +187,17 @@ type incomingConn struct {
 	decode         *proto.DecodeOptions
 	nextID         uint16
 	idMu           sync.Mutex
+	packetIDs      map[uint16]struct{}
 	session        *sessionState
 	persistent     bool
 	incomingQoS2   map[uint16]*proto.Publish
 	outgoingQoS2   map[uint16]*proto.Publish
 	outgoingStored map[uint16]uint64
 	qosMu          sync.Mutex
+	connected      bool
+	keepAlive      time.Duration
+	closed         chan struct{}
+	closeOnce      sync.Once
 	done           chan struct{}
 }
 
@@ -228,22 +233,47 @@ func (c *incomingConn) del() {
 }
 
 // Queue a message; no notification of sending is done.
-func (c *incomingConn) submit(m proto.Message) {
+func (c *incomingConn) stop() {
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		_ = c.conn.Close()
+	})
+}
+
+func (c *incomingConn) submit(m proto.Message) bool {
 	proto.SetVersion(m, c.version)
 	j := job{m: m}
 	select {
 	case c.jobs <- j:
+		return true
+	case <-c.closed:
+		return false
 	default:
-		log.Print(c, ": failed to submit message")
+		// MQTT control packets cannot be dropped safely. A full per-client
+		// queue therefore means the peer is too slow and the connection is
+		// closed instead of silently corrupting protocol state.
+		log.Print(c, ": outbound queue full; closing slow client")
+		c.stop()
+		return false
 	}
 }
 
 // Queue a message, returns a channel that will be readable
 // when the message is sent.
 func (c *incomingConn) submitSync(m proto.Message) receipt {
-	j := job{m: m, r: make(receipt, 1)}
-	c.jobs <- j
-	return j.r
+	r := make(receipt, 1)
+	j := job{m: m, r: r}
+	select {
+	case c.jobs <- j:
+	case <-c.closed:
+		r <- ErrClientClosed
+		close(r)
+	default:
+		r <- ErrClientClosed
+		close(r)
+		c.stop()
+	}
+	return r
 }
 
 func (c *incomingConn) String() string {
@@ -254,13 +284,14 @@ func (c *incomingConn) reader() {
 	// On exit, close the connection and arrange for the writer to exit
 	// by closing the output channel.
 	defer func() {
-		c.conn.Close()
 		c.svr.stats.clientDisconnect()
-		close(c.jobs)
+		c.stop()
 	}()
 
 	for {
-		// TODO: timeout (first message and/or keepalives)
+		if c.keepAlive > 0 {
+			_ = c.conn.SetReadDeadline(time.Now().Add(c.keepAlive + c.keepAlive/2))
+		}
 		m, err := proto.DecodeOneMessage(c.conn, c.decode)
 		if err != nil {
 			if err == io.EOF {
@@ -280,7 +311,7 @@ func (c *incomingConn) reader() {
 
 		switch m := m.(type) {
 		case *proto.Connect:
-			if c.clientid != "" {
+			if c.connected {
 				return
 			}
 			c.version = proto.ProtocolVersion(m.ProtocolVersion)
@@ -295,19 +326,28 @@ func (c *incomingConn) reader() {
 			if len(m.ClientId) < 1 && !m.CleanSession {
 				rc = proto.RetCodeIdentifierRejected
 			}
-			c.clientid = m.ClientId
-			// Disconnect existing connections.
-			if existing := c.add(); existing != nil {
-				disconnect := &proto.Disconnect{}
-				r := existing.submitSync(disconnect)
-				_ = r.wait()
-				<-existing.done
-				c.svr.clientsMu.Lock()
-				c.svr.clients[c.clientid] = c
-				c.svr.clientsMu.Unlock()
+			assignedClientID := false
+			if rc == proto.RetCodeAccepted && m.ClientId == "" {
+				m.ClientId = fmt.Sprintf("mqtt-%d", atomic.AddUint64(&c.svr.clientSeq, 1))
+				assignedClientID = true
 			}
+			c.clientid = m.ClientId
+			c.keepAlive = time.Duration(m.KeepAliveTimer) * time.Second
 			sessionPresent := false
 			if rc == proto.RetCodeAccepted {
+				// Only an accepted CONNECT may take over an existing ClientID.
+				if existing := c.add(); existing != nil {
+					if existing.version == proto.Version5 {
+						r := existing.submitSync(&proto.Disconnect{ReasonCode: 0x8e})
+						_ = r.wait()
+					} else {
+						existing.stop()
+					}
+					<-existing.done
+					c.svr.clientsMu.Lock()
+					c.svr.clients[c.clientid] = c
+					c.svr.clientsMu.Unlock()
+				}
 				sessionPresent = c.svr.attachSession(c, m)
 			}
 
@@ -326,6 +366,9 @@ func (c *incomingConn) reader() {
 			}
 			if c.version == proto.Version5 {
 				connack.Properties = connack.Properties.Add(proto.PropertySharedSubscriptionAvailable, boolToProperty(c.svr.options.EnableSharedSubscriptions))
+				if assignedClientID {
+					connack.Properties = connack.Properties.Add(proto.PropertyAssignedClientIdentifier, c.clientid)
+				}
 			}
 			c.submit(connack)
 
@@ -334,6 +377,7 @@ func (c *incomingConn) reader() {
 				log.Printf("Connection refused for %v: %v", c.conn.RemoteAddr(), ConnectionErrors[rc])
 				return
 			}
+			c.connected = true
 			c.deliverSessionQueue()
 
 			// Log in mosquitto format.
@@ -344,7 +388,7 @@ func (c *incomingConn) reader() {
 			log.Printf("New client connected from %v as %v (c%v, k%v).", c.conn.RemoteAddr(), c.clientid, clean, m.KeepAliveTimer)
 
 		case *proto.Publish:
-			if c.clientid == "" {
+			if !c.connected {
 				return
 			}
 			if m.Header.QosLevel == proto.QosExactlyOnce {
@@ -377,7 +421,7 @@ func (c *incomingConn) reader() {
 			}
 
 		case *proto.PingReq:
-			if c.clientid == "" {
+			if !c.connected {
 				return
 			}
 			c.submit(&proto.PingResp{})
@@ -428,7 +472,7 @@ func (c *incomingConn) reader() {
 			c.ackOutgoing(m.MessageId)
 
 		case *proto.Subscribe:
-			if c.clientid == "" {
+			if !c.connected {
 				return
 			}
 			if m.Header.QosLevel != proto.QosAtLeastOnce {
@@ -484,7 +528,7 @@ func (c *incomingConn) reader() {
 			}
 
 		case *proto.Unsubscribe:
-			if c.clientid == "" {
+			if !c.connected {
 				return
 			}
 			if m.Header.QosLevel != proto.QosAtMostOnce && m.MessageId == 0 {
@@ -514,15 +558,20 @@ func (c *incomingConn) reader() {
 }
 
 func (c *incomingConn) writer() {
-	// Close connection on exit in order to cause reader to exit.
 	defer func() {
-		c.conn.Close()
+		c.stop()
 		c.del()
 		c.svr.detachSession(c)
 		close(c.done)
 	}()
 
-	for job := range c.jobs {
+	for {
+		var job job
+		select {
+		case job = <-c.jobs:
+		case <-c.closed:
+			return
+		}
 		if c.svr.Dump {
 			log.Printf("dump out: %T", job.m)
 		}
@@ -573,9 +622,10 @@ type post struct {
 }
 
 type subscriptions struct {
-	workers    int
 	mu         sync.Mutex // guards access to fields below
 	posts      chan post
+	done       chan struct{}
+	closeOnce  sync.Once
 	retain     map[string]retain
 	subs       map[string][]subscription // topic <-> conns
 	wildcards  []wild
@@ -600,21 +650,20 @@ func (s subscription) clientID() string {
 	return ""
 }
 
-// The length of the queue that subscription processing
-// workers are taking from.
+// The length of the ordered subscription dispatcher queue.
 const postQueue = 100
 
-func newSubscriptions(workers int) *subscriptions {
+func newSubscriptions() *subscriptions {
 	s := &subscriptions{
 		subs:       make(map[string][]subscription),
 		retain:     make(map[string]retain),
 		posts:      make(chan post, postQueue),
-		workers:    workers,
+		done:       make(chan struct{}),
 		roundRobin: make(map[string]uint64),
 	}
-	for i := 0; i < s.workers; i++ {
-		go s.run(i)
-	}
+	// One dispatcher preserves ordered-topic delivery. Socket writes remain
+	// parallel because each connection has its own writer goroutine.
+	go s.run()
 	return s
 }
 
@@ -624,6 +673,9 @@ func (s *subscriptions) sendRetain(tq proto.TopicQos, c *incomingConn) {
 	_, filter, _ := parseSharedFilter(tq.Topic)
 	w := newWild(filter, nil)
 	for name, retained := range s.retain {
+		if strings.HasPrefix(name, "$") && !strings.HasPrefix(filter, "$") {
+			continue
+		}
 		if (!isWildcard(filter) && name == filter) || (isWildcard(filter) && w.matches(strings.Split(name, "/"))) {
 			m := retained.m
 			if m.QosLevel > tq.Qos {
@@ -631,6 +683,9 @@ func (s *subscriptions) sendRetain(tq proto.TopicQos, c *incomingConn) {
 			}
 			if m.QosLevel.HasId() {
 				m.MessageId = c.nextMessageID()
+				if m.MessageId == 0 {
+					continue
+				}
 			}
 			messages = append(messages, m)
 		}
@@ -779,6 +834,11 @@ func (s *subscriptions) subscribers(topic string) []subscription {
 	// process wildcards
 	parts := strings.Split(topic, "/")
 	for _, w := range s.wildcards {
+		// A leading wildcard does not match Topic Names beginning with '$'.
+		// Shared subscriptions store the inner filter in w.wild.
+		if strings.HasPrefix(topic, "$") && (len(w.wild) == 0 || !strings.HasPrefix(w.wild[0], "$")) {
+			continue
+		}
 		if w.matches(parts) {
 			candidates = append(candidates, w.sub)
 		}
@@ -846,11 +906,15 @@ func (s *subscriptions) unsub(topic string, c *incomingConn) {
 	s.mu.Unlock()
 }
 
-// The subscription processing worker.
-func (s *subscriptions) run(id int) {
-	tag := fmt.Sprintf("worker %d ", id)
-	log.Print(tag, "started")
-	for post := range s.posts {
+// run is the ordered subscription dispatcher.
+func (s *subscriptions) run() {
+	for {
+		var post post
+		select {
+		case post = <-s.posts:
+		case <-s.done:
+			return
+		}
 		// Remember the original retain setting, but send out immediate
 		// copies without retain: "When a server sends a PUBLISH to a client
 		// as a result of a subscription that already existed when the
@@ -860,11 +924,11 @@ func (s *subscriptions) run(id int) {
 
 		// Handle "retain with payload size zero = delete retain".
 		// Once the delete is done, return instead of continuing.
-		if isRetain && post.m.Payload.Size() == 0 {
+		deleteRetained := isRetain && post.m.Payload.Size() == 0
+		if deleteRetained {
 			s.mu.Lock()
 			delete(s.retain, post.m.TopicName)
 			s.mu.Unlock()
-			return
 		}
 		// Find all the connections that should be notified of this message.
 		conns := s.subscribers(post.m.TopicName)
@@ -884,6 +948,9 @@ func (s *subscriptions) run(id int) {
 			if sub.c != nil {
 				if out.QosLevel.HasId() {
 					out.MessageId = sub.c.nextMessageID()
+					if out.MessageId == 0 {
+						continue
+					}
 				} else {
 					out.MessageId = 0
 				}
@@ -901,7 +968,7 @@ func (s *subscriptions) run(id int) {
 			}
 		}
 
-		if isRetain {
+		if isRetain && !deleteRetained {
 			s.mu.Lock()
 			// Save a copy of it, and set that copy's Retain to true, so that
 			// when we send it out later we notify new subscribers that this
@@ -914,8 +981,17 @@ func (s *subscriptions) run(id int) {
 	}
 }
 
-func (s *subscriptions) submit(c *incomingConn, m *proto.Publish) {
-	s.posts <- post{c: c, m: m}
+func (s *subscriptions) submit(c *incomingConn, m *proto.Publish) bool {
+	select {
+	case s.posts <- post{c: c, m: m}:
+		return true
+	case <-s.done:
+		return false
+	}
+}
+
+func (s *subscriptions) close() {
+	s.closeOnce.Do(func() { close(s.done) })
 }
 
 func isWildcard(topic string) bool {
@@ -1015,12 +1091,48 @@ func (ip intPayload) Size() int {
 func (c *incomingConn) nextMessageID() uint16 {
 	c.idMu.Lock()
 	defer c.idMu.Unlock()
-	id := c.nextID
-	c.nextID++
-	if c.nextID == 0 {
-		c.nextID = 1
+	for i := 0; i < 65535; i++ {
+		if c.nextID == 0 {
+			c.nextID = 1
+		}
+		id := c.nextID
+		c.nextID++
+		if _, used := c.packetIDs[id]; used {
+			continue
+		}
+		c.packetIDs[id] = struct{}{}
+		return id
 	}
-	return id
+	c.stop()
+	return 0
+}
+
+func (c *incomingConn) reserveMessageID(id uint16) bool {
+	if id == 0 {
+		return false
+	}
+	c.idMu.Lock()
+	defer c.idMu.Unlock()
+	if _, used := c.packetIDs[id]; used {
+		return true
+	}
+	c.packetIDs[id] = struct{}{}
+	if id >= c.nextID {
+		c.nextID = id + 1
+		if c.nextID == 0 {
+			c.nextID = 1
+		}
+	}
+	return true
+}
+
+func (c *incomingConn) releaseMessageID(id uint16) {
+	if id == 0 {
+		return
+	}
+	c.idMu.Lock()
+	delete(c.packetIDs, id)
+	c.idMu.Unlock()
 }
 
 type stats struct {

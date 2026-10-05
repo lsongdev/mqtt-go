@@ -1,0 +1,213 @@
+package mqtt
+
+import (
+	"io"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/lsongdev/mqtt-go/proto"
+)
+
+func receivePublish(t *testing.T, c *ClientConn) *proto.Publish {
+	t.Helper()
+	select {
+	case m := <-c.Incoming:
+		if m == nil {
+			t.Fatal("client closed while waiting for publish")
+		}
+		return m
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for publish")
+		return nil
+	}
+}
+
+func TestRetainedDeleteIsDeliveredAndDispatcherContinues(t *testing.T) {
+	server := NewServer()
+	defer server.Close()
+
+	sub := pipeClient(t, server, ClientOptions{ClientID: "sub", CleanStart: true})
+	pub := pipeClient(t, server, ClientOptions{ClientID: "pub", CleanStart: true})
+	if ack := sub.Subscribe([]proto.TopicQos{{Topic: "retained/#"}}); ack == nil {
+		t.Fatal("subscribe failed")
+	}
+
+	if err := pub.Publish(&proto.Publish{Header: proto.Header{Retain: true}, TopicName: "retained/value", Payload: proto.BytesPayload("saved")}); err != nil {
+		t.Fatal(err)
+	}
+	if got := receivePublish(t, sub); string(got.Payload.(proto.BytesPayload)) != "saved" {
+		t.Fatalf("initial retained publish = %q", got.Payload)
+	}
+
+	if err := pub.Publish(&proto.Publish{Header: proto.Header{Retain: true}, TopicName: "retained/value", Payload: proto.BytesPayload(nil)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := receivePublish(t, sub); got.Payload.Size() != 0 {
+		t.Fatalf("retained delete payload size = %d", got.Payload.Size())
+	}
+
+	if err := pub.Publish(&proto.Publish{TopicName: "retained/after", Payload: proto.BytesPayload("after")}); err != nil {
+		t.Fatal(err)
+	}
+	if got := receivePublish(t, sub); string(got.Payload.(proto.BytesPayload)) != "after" {
+		t.Fatalf("dispatcher stopped after retained delete: %q", got.Payload)
+	}
+}
+
+func TestDollarTopicDoesNotMatchLeadingWildcard(t *testing.T) {
+	server := NewServer()
+	defer server.Close()
+
+	general := pipeClient(t, server, ClientOptions{ClientID: "general", CleanStart: true})
+	system := pipeClient(t, server, ClientOptions{ClientID: "system", CleanStart: true})
+	pub := pipeClient(t, server, ClientOptions{ClientID: "publisher", CleanStart: true})
+	general.Subscribe([]proto.TopicQos{{Topic: "#"}})
+	system.Subscribe([]proto.TopicQos{{Topic: "$private/#"}})
+
+	if err := pub.Publish(&proto.Publish{TopicName: "$private/test", Payload: proto.BytesPayload("ok")}); err != nil {
+		t.Fatal(err)
+	}
+	if got := receivePublish(t, system); got.TopicName != "$private/test" {
+		t.Fatalf("system subscriber got %q", got.TopicName)
+	}
+	select {
+	case got := <-general.Incoming:
+		t.Fatalf("leading wildcard matched $ topic: %#v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestServerAssignsEmptyV5ClientID(t *testing.T) {
+	server := NewServer()
+	defer server.Close()
+	serverSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+	server.ServeConn(serverSide)
+
+	connect := &proto.Connect{
+		ProtocolName: proto.PROTOCOL_5_0, ProtocolVersion: 5,
+		CleanSession: true, ClientId: "",
+	}
+	if err := connect.Encode(clientSide); err != nil {
+		t.Fatal(err)
+	}
+	decode := &proto.DecodeOptions{Version: proto.Version5}
+	message, err := proto.DecodeOneMessage(clientSide, decode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack := message.(*proto.ConnAck)
+	values := ack.Properties.Values(proto.PropertyAssignedClientIdentifier)
+	if len(values) != 1 || values[0] == "" {
+		t.Fatalf("assigned client id property = %#v", values)
+	}
+
+	if err := (&proto.PingReq{Header: proto.Header{Version: proto.Version5}}).Encode(clientSide); err != nil {
+		t.Fatal(err)
+	}
+	if message, err = proto.DecodeOneMessage(clientSide, decode); err != nil {
+		t.Fatal(err)
+	} else if _, ok := message.(*proto.PingResp); !ok {
+		t.Fatalf("after assigned id got %T", message)
+	}
+}
+
+func TestPacketIdentifierWrapSkipsZero(t *testing.T) {
+	c := &ClientConn{id: 65535, packetIDs: make(map[uint16]struct{})}
+	id, err := c.nextid()
+	if err != nil || id != 65535 {
+		t.Fatalf("first id = %d, %v", id, err)
+	}
+	c.releaseid(id)
+	c.packetIDs[1] = struct{}{}
+	id, err = c.nextid()
+	if err != nil || id != 2 {
+		t.Fatalf("wrapped id = %d, %v", id, err)
+	}
+}
+
+func TestServerKeepAliveClosesIdleConnection(t *testing.T) {
+	server := NewServer()
+	defer server.Close()
+	serverSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+	server.ServeConn(serverSide)
+
+	connect := &proto.Connect{
+		ProtocolName: proto.PROTOCOL_3_1_1, ProtocolVersion: 4,
+		CleanSession: true, ClientId: "idle", KeepAliveTimer: 1,
+	}
+	if err := connect.Encode(clientSide); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := proto.DecodeOneMessage(clientSide, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = clientSide.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var one [1]byte
+	_, err := clientSide.Read(one[:])
+	if err == nil {
+		t.Fatal("idle connection remained open")
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatalf("broker did not enforce keepalive: %v", err)
+	}
+	if err != io.EOF {
+		// net.Pipe can surface a closed-pipe error depending on which side
+		// observes the close first; either way it must not be a timeout.
+		t.Logf("idle connection closed with %v", err)
+	}
+}
+
+func TestBrokerPacketIdentifierWrapSkipsZero(t *testing.T) {
+	c := &incomingConn{
+		nextID:    65535,
+		packetIDs: make(map[uint16]struct{}),
+		closed:    make(chan struct{}),
+	}
+	id := c.nextMessageID()
+	if id != 65535 {
+		t.Fatalf("first id = %d", id)
+	}
+	c.releaseMessageID(id)
+	c.packetIDs[1] = struct{}{}
+	id = c.nextMessageID()
+	if id != 2 {
+		t.Fatalf("wrapped id = %d", id)
+	}
+}
+
+func TestClientKeepAliveClosesWhenPingResponseIsMissing(t *testing.T) {
+	serverSide, clientSide := net.Pipe()
+	defer serverSide.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		if _, err := proto.DecodeOneMessage(serverSide, nil); err != nil {
+			return
+		}
+		if err := (&proto.ConnAck{}).Encode(serverSide); err != nil {
+			return
+		}
+		_, _ = proto.DecodeOneMessage(serverSide, nil) // PINGREQ; intentionally no PINGRESP.
+	}()
+
+	client := NewClientConn(clientSide)
+	if err := client.ConnectWithOptions(ClientOptions{
+		ClientID:   "keepalive-client",
+		CleanStart: true,
+		KeepAlive:  1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-client.closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("client kept connection open without PINGRESP")
+	}
+	<-serverDone
+}
