@@ -377,6 +377,10 @@ func (msg *Publish) Encode(w io.Writer) (err error) {
 	if payload == nil {
 		payload = BytesPayload(nil)
 	}
+	payloadSize := payload.Size()
+	if payloadSize < 0 || payloadSize > MaxPayloadSize {
+		return msgTooLongError
+	}
 
 	setString(msg.TopicName, buf)
 	if msg.Header.QosLevel.HasId() {
@@ -388,7 +392,7 @@ func (msg *Publish) Encode(w io.Writer) (err error) {
 		}
 	}
 
-	if err = writeMessage(w, MsgPublish, &msg.Header, buf, int32(payload.Size())); err != nil {
+	if err = writeMessage(w, MsgPublish, &msg.Header, buf, int32(payloadSize)); err != nil {
 		return
 	}
 
