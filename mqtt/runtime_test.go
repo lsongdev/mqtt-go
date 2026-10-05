@@ -304,19 +304,29 @@ func TestBrokerAuthentication(t *testing.T) {
 				t.Fatal("authenticated client missing")
 			}
 
+			server.clientsMu.Lock()
+			existing := server.clients["auth-client"]
+			server.clientsMu.Unlock()
+
 			serverSide, clientSide := net.Pipe()
 			server.ServeConn(serverSide)
 			bad := NewClientConn(clientSide)
 			defer bad.Close()
 			err = bad.ConnectWithOptions(ClientOptions{
 				ProtocolVersion: version,
-				ClientID:        "auth-client-2",
+				ClientID:        "auth-client",
 				CleanStart:      true,
 				Username:        "user",
 				Password:        "wrong",
 			})
-			if !errors.Is(err, ErrNotAuthorized) && !errors.Is(err, ErrBadCredentials) {
+			if !errors.Is(err, ErrBadCredentials) {
 				t.Fatalf("unexpected auth error: %v", err)
+			}
+			server.clientsMu.Lock()
+			current := server.clients["auth-client"]
+			server.clientsMu.Unlock()
+			if current != existing {
+				t.Fatal("rejected CONNECT took over existing ClientID")
 			}
 		})
 	}
@@ -518,5 +528,42 @@ func TestAutomaticReconnectReplaysSubscriptions(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("reconnected subscription did not receive publish")
+	}
+}
+
+func TestV5DisconnectWithWillMessagePublishesWill(t *testing.T) {
+	server := NewServer()
+	defer server.Close()
+
+	sub := pipeClient(t, server, ClientOptions{
+		ProtocolVersion: proto.Version5,
+		ClientID:        "disconnect-will-sub",
+		CleanStart:      true,
+	})
+	sub.Subscribe([]proto.TopicQos{{Topic: "will/#"}})
+
+	pub := pipeClient(t, server, ClientOptions{
+		ProtocolVersion: proto.Version5,
+		ClientID:        "disconnect-will-pub",
+		CleanStart:      true,
+		Will: &Will{
+			Topic:   "will/disconnect",
+			Payload: []byte("requested"),
+			Properties: proto.Properties{}.
+				Add(proto.PropertyContentType, "text/plain"),
+		},
+	})
+	if err := pub.sync(&proto.Disconnect{ReasonCode: 0x04}); err != nil {
+		t.Fatal(err)
+	}
+	<-pub.done
+
+	got := receivePublish(t, sub)
+	if got.TopicName != "will/disconnect" || string(got.Payload.(proto.BytesPayload)) != "requested" {
+		t.Fatalf("will: %#v", got)
+	}
+	values := got.Properties.Values(proto.PropertyContentType)
+	if len(values) != 1 || values[0] != "text/plain" {
+		t.Fatalf("will properties: %#v", got.Properties)
 	}
 }
