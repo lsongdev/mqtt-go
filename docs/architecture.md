@@ -21,7 +21,8 @@ It does not own broker routing, sessions, reconnect policy, or application callb
 `mqtt` owns protocol state and runtime behavior:
 
 - client connection state, Keep Alive, packet identifier leases, QoS handshakes
-- broker connection state and session lifecycle
+- managed TCP reconnect and subscription replay above the one-transport client
+- broker CONNECT authentication, connection state, Last Will, and session lifecycle
 - ordered subscription routing and retained messages
 - optional persistent sessions and SQLite storage
 - transport adapters such as WebSocket
@@ -41,12 +42,17 @@ The implementation relies on a small set of invariants:
 5. Packet identifier 0 is never allocated or accepted where an identifier is required. Client identifiers remain leased until the matching acknowledgement completes.
 6. Decoder size limits are checked before payload allocation.
 7. `proto` rejects malformed wire state; `mqtt` handles valid packet state transitions.
+8. Authentication completes before a connection can take over a ClientID or attach to Session state.
+9. Last Will belongs to the connection/session lifecycle: normal DISCONNECT discards it; abnormal close schedules it; Session resume can cancel a delayed Will.
+10. Automatic reconnect does not mutate `ClientConn` semantics. A `ReconnectingClient` owns successive `ClientConn` values and never silently queues application publishes while disconnected.
 
 ## Session persistence
 
 `SessionStore` is the persistence boundary. Broker logic owns MQTT session semantics; a store only serializes and restores `StoredSession` values.
 
 The built-in SQLite store is optional. The default broker remains fully in-memory.
+Pending delayed Wills are also in-memory and are not restored after a broker
+process restart.
 
 ## Testing
 
@@ -59,4 +65,8 @@ go test ./...
 go test -race ./...
 ```
 
-Protocol tests include exact wire encodings, malformed packets, MQTT 5 property validation, QoS flows, persistent sessions, retained-message behavior, topic matching, Keep Alive, packet identifier wraparound, and a decoder fuzz target.
+Protocol and runtime tests include exact wire encodings, malformed packets,
+MQTT 5 property validation, CONNECT authentication, Last Will/Will Delay,
+automatic reconnect and subscription replay, QoS flows, persistent sessions,
+retained-message behavior, topic matching, Keep Alive, packet identifier
+wraparound, and a decoder fuzz target.
