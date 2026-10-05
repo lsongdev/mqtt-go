@@ -35,8 +35,10 @@ func init() {
 // Concurrent access to a ClientConn is NOT safe.
 type ClientConn struct {
 	conn            net.Conn
-	ClientId        string        // May be set before the call to Connect.
-	id              uint16        // next MessageId
+	ClientId        string // May be set before the call to Connect.
+	id              uint16 // next packet identifier
+	idMu            sync.Mutex
+	packetIDs       map[uint16]struct{}
 	done            chan struct{} // This channel will be readable once a Disconnect has been successfully sent and the connection is closed.
 	closed          chan struct{}
 	out             chan job
@@ -44,11 +46,14 @@ type ClientConn struct {
 	connack         chan *proto.ConnAck
 	suback          chan *proto.SubAck
 	unsuback        chan *proto.UnsubAck
+	pingresp        chan struct{}
 	Dump            bool                  // When true, dump the messages in and out.
 	ProtocolVersion proto.ProtocolVersion // Defaults to MQTT 3.1.1 (level 4).
 	decode          *proto.DecodeOptions
 	EnableQoS2      bool
 	SessionPresent  bool
+	keepAlive       time.Duration
+	keepAliveOnce   sync.Once
 	qosMu           sync.Mutex
 	incomingQoS2    map[uint16]*proto.Publish
 	outgoingQoS2    map[uint16]*proto.Publish
@@ -63,13 +68,28 @@ type ClientOptions struct {
 	CleanStart      bool
 	KeepAlive       uint16
 	Properties      proto.Properties
+	Will            *Will
 	EnableQoS2      bool
 	SessionExpiry   time.Duration
+	MaxPacketSize   int
+}
+
+func propertyString(properties proto.Properties, id proto.PropertyID) (string, bool) {
+	for _, p := range properties {
+		if p.ID == id {
+			value, ok := p.Value.(string)
+			return value, ok
+		}
+	}
+	return "", false
 }
 
 func (o ClientOptions) normalized() ClientOptions {
 	if o.ProtocolVersion == 0 {
 		o.ProtocolVersion = proto.Version311
+	}
+	if o.MaxPacketSize == 0 {
+		o.MaxPacketSize = DefaultMaxPacketSize
 	}
 	if o.ClientID == "" {
 		o.CleanStart = true
@@ -85,6 +105,7 @@ func NewClientConn(c net.Conn) *ClientConn {
 	cc := &ClientConn{
 		conn:            c,
 		id:              1,
+		packetIDs:       make(map[uint16]struct{}),
 		out:             make(chan job, clientQueueLength),
 		Incoming:        make(chan *proto.Publish, clientQueueLength),
 		done:            make(chan struct{}),
@@ -92,6 +113,7 @@ func NewClientConn(c net.Conn) *ClientConn {
 		connack:         make(chan *proto.ConnAck),
 		suback:          make(chan *proto.SubAck),
 		unsuback:        make(chan *proto.UnsubAck),
+		pingresp:        make(chan struct{}, 1),
 		ProtocolVersion: proto.Version311,
 		decode:          decode,
 		incomingQoS2:    make(map[uint16]*proto.Publish),
@@ -136,7 +158,6 @@ func (c *ClientConn) reader() {
 	}()
 
 	for {
-		// TODO: timeout (first message and/or keepalives)
 		m, err := proto.DecodeOneMessage(c.conn, c.decode)
 		if err != nil {
 			if err == io.EOF {
@@ -165,22 +186,22 @@ func (c *ClientConn) reader() {
 					c.incomingQoS2[m.MessageId] = &copy
 				}
 				c.qosMu.Unlock()
-				c.out <- job{m: &proto.PubRec{MessageId: m.MessageId}}
+				c.send(&proto.PubRec{MessageId: m.MessageId})
 				continue
 			}
 			if m.QosLevel == proto.QosAtLeastOnce {
-				c.out <- job{m: &proto.PubAck{MessageId: m.MessageId}}
+				c.send(&proto.PubAck{MessageId: m.MessageId})
 			}
 			c.Incoming <- m
 		case *proto.PubAck:
-			// ignore these
+			c.releaseid(m.MessageId)
 			continue
 		case *proto.PubRec:
 			c.qosMu.Lock()
 			_, ok := c.outgoingQoS2[m.MessageId]
 			c.qosMu.Unlock()
 			if ok {
-				c.out <- job{m: &proto.PubRel{MessageId: m.MessageId}}
+				c.send(&proto.PubRel{MessageId: m.MessageId})
 			}
 		case *proto.PubRel:
 			c.qosMu.Lock()
@@ -192,17 +213,26 @@ func (c *ClientConn) reader() {
 			if ok {
 				c.Incoming <- publish
 			}
-			c.out <- job{m: &proto.PubComp{MessageId: m.MessageId}}
+			c.send(&proto.PubComp{MessageId: m.MessageId})
 		case *proto.PubComp:
 			c.qosMu.Lock()
 			delete(c.outgoingQoS2, m.MessageId)
 			c.qosMu.Unlock()
+			c.releaseid(m.MessageId)
 		case *proto.ConnAck:
 			c.connack <- m
 		case *proto.SubAck:
+			c.releaseid(m.MessageId)
 			c.suback <- m
 		case *proto.UnsubAck:
+			c.releaseid(m.MessageId)
 			c.unsuback <- m
+		case *proto.PingResp:
+			select {
+			case c.pingresp <- struct{}{}:
+			default:
+			}
+			continue
 		case *proto.Disconnect:
 			return
 		default:
@@ -232,7 +262,6 @@ func (c *ClientConn) writer() {
 			log.Printf("dump out: %T", job.m)
 		}
 
-		// TODO: write timeout
 		proto.SetVersion(job.m, c.ProtocolVersion)
 		err := job.m.Encode(c.conn)
 		if job.r != nil {
@@ -261,14 +290,15 @@ func (c *ClientConn) Connect(user, pass string) error {
 // ConnectWithOptions sends a versioned CONNECT packet on an existing transport.
 func (c *ClientConn) ConnectWithOptions(options ClientOptions) error {
 	options = options.normalized()
-	// TODO: Keepalive timer
-	if options.ClientID == "" {
+	requestedAssignedID := options.ClientID == "" && options.ProtocolVersion == proto.Version5
+	if options.ClientID == "" && options.ProtocolVersion != proto.Version5 {
 		options.ClientID = fmt.Sprint(cliRand.Int63())
 	}
 	c.ClientId = options.ClientID
 	c.ProtocolVersion = options.ProtocolVersion
 	c.EnableQoS2 = options.EnableQoS2
 	c.decode.Version = options.ProtocolVersion
+	c.decode.MaxPacketSize = options.MaxPacketSize
 	req := &proto.Connect{
 		ProtocolName:    proto.PROTOCOL_3_1_1,
 		ProtocolVersion: uint8(options.ProtocolVersion),
@@ -276,6 +306,16 @@ func (c *ClientConn) ConnectWithOptions(options ClientOptions) error {
 		CleanSession:    options.CleanStart,
 		KeepAliveTimer:  options.KeepAlive,
 		Properties:      options.Properties,
+	}
+	if options.Will != nil {
+		req.WillFlag = true
+		req.WillQos = options.Will.QoS
+		req.WillRetain = options.Will.Retain
+		req.WillTopic = options.Will.Topic
+		req.WillMessage = string(options.Will.Payload)
+		if options.ProtocolVersion == proto.Version5 {
+			req.WillProperties = append(proto.Properties(nil), options.Will.Properties...)
+		}
 	}
 	if options.Username != "" {
 		req.UsernameFlag = true
@@ -309,10 +349,28 @@ func (c *ClientConn) ConnectWithOptions(options ClientOptions) error {
 	}
 	if ack.ReturnCode == proto.RetCodeAccepted {
 		c.SessionPresent = ack.SessionPresent
+		if requestedAssignedID {
+			assigned, ok := propertyString(ack.Properties, proto.PropertyAssignedClientIdentifier)
+			if !ok || assigned == "" {
+				_ = c.conn.Close()
+				return fmt.Errorf("mqtt: server accepted empty client id without Assigned Client Identifier")
+			}
+			c.ClientId = assigned
+		}
+		if options.KeepAlive > 0 {
+			c.keepAlive = time.Duration(options.KeepAlive) * time.Second
+			c.keepAliveOnce.Do(func() { go c.keepAliveLoop() })
+		}
 		return nil
 	}
 	if int(ack.ReturnCode) < len(ConnectionErrors) {
 		return ConnectionErrors[ack.ReturnCode]
+	}
+	switch ack.ReturnCode {
+	case proto.ReturnCode(0x86):
+		return ErrBadCredentials
+	case proto.ReturnCode(0x87):
+		return ErrNotAuthorized
 	}
 	return fmt.Errorf("connection refused: reason code 0x%02x", uint8(ack.ReturnCode))
 }
@@ -356,22 +414,92 @@ func (c *ClientConn) Disconnect() {
 // Close immediately closes the underlying transport.
 func (c *ClientConn) Close() error { return c.conn.Close() }
 
-func (c *ClientConn) nextid() uint16 {
-	id := c.id
-	c.id++
-	return id
+func (c *ClientConn) nextid() (uint16, error) {
+	c.idMu.Lock()
+	defer c.idMu.Unlock()
+	for i := 0; i < 65535; i++ {
+		if c.id == 0 {
+			c.id = 1
+		}
+		id := c.id
+		c.id++
+		if _, used := c.packetIDs[id]; used {
+			continue
+		}
+		c.packetIDs[id] = struct{}{}
+		return id, nil
+	}
+	return 0, ErrPacketIdentifiersExhausted
+}
+
+func (c *ClientConn) releaseid(id uint16) {
+	if id == 0 {
+		return
+	}
+	c.idMu.Lock()
+	delete(c.packetIDs, id)
+	c.idMu.Unlock()
+}
+
+func (c *ClientConn) send(m proto.Message) bool {
+	select {
+	case c.out <- job{m: m}:
+		return true
+	case <-c.closed:
+		return false
+	}
+}
+
+func (c *ClientConn) keepAliveLoop() {
+	ticker := time.NewTicker(c.keepAlive)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			// Discard a stale response before starting a new ping exchange.
+			select {
+			case <-c.pingresp:
+			default:
+			}
+			if err := c.sync(&proto.PingReq{}); err != nil {
+				return
+			}
+			timer := time.NewTimer(c.keepAlive)
+			select {
+			case <-c.pingresp:
+				if !timer.Stop() {
+					<-timer.C
+				}
+			case <-timer.C:
+				_ = c.conn.Close()
+				return
+			case <-c.closed:
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return
+			}
+		case <-c.closed:
+			return
+		}
+	}
 }
 
 // Subscribe subscribes this connection to a list of topics. Messages
 // will be delivered on the Incoming channel.
 func (c *ClientConn) Subscribe(tqs []proto.TopicQos) *proto.SubAck {
+	id, err := c.nextid()
+	if err != nil {
+		return nil
+	}
 	m := &proto.Subscribe{
 		Header:    header(dupFalse, proto.QosAtLeastOnce, retainFalse),
-		MessageId: c.nextid(),
+		MessageId: id,
 		Topics:    tqs,
 	}
 	proto.SetVersion(m, c.ProtocolVersion)
 	if err := c.sync(m); err != nil {
+		c.releaseid(id)
 		return nil
 	}
 	select {
@@ -384,9 +512,14 @@ func (c *ClientConn) Subscribe(tqs []proto.TopicQos) *proto.SubAck {
 
 // Unsubscribe removes the given topic filters and waits for UNSUBACK.
 func (c *ClientConn) Unsubscribe(topics []string) *proto.UnsubAck {
-	m := &proto.Unsubscribe{MessageId: c.nextid(), Topics: topics}
+	id, err := c.nextid()
+	if err != nil {
+		return nil
+	}
+	m := &proto.Unsubscribe{MessageId: id, Topics: topics}
 	proto.SetVersion(m, c.ProtocolVersion)
 	if err := c.sync(m); err != nil {
+		c.releaseid(id)
 		return nil
 	}
 	select {
@@ -400,12 +533,21 @@ func (c *ClientConn) Unsubscribe(topics []string) *proto.UnsubAck {
 // Publish publishes the given message to the MQTT server.
 // QoS 0 and QoS 1 are always supported. QoS 2 requires EnableQoS2 in the
 // ClientOptions used to connect.
-func (c *ClientConn) Publish(m *proto.Publish) {
-	if m.QosLevel > proto.QosExactlyOnce || (m.QosLevel == proto.QosExactlyOnce && !c.EnableQoS2) {
-		panic("unsupported QoS level")
+func (c *ClientConn) Publish(m *proto.Publish) error {
+	if m == nil {
+		return fmt.Errorf("mqtt: nil publish")
 	}
+	if m.QosLevel > proto.QosExactlyOnce || (m.QosLevel == proto.QosExactlyOnce && !c.EnableQoS2) {
+		return fmt.Errorf("mqtt: unsupported QoS level %d", m.QosLevel)
+	}
+	allocated := false
 	if m.QosLevel.HasId() {
-		m.MessageId = c.nextid()
+		id, err := c.nextid()
+		if err != nil {
+			return err
+		}
+		m.MessageId = id
+		allocated = true
 	}
 	proto.SetVersion(m, c.ProtocolVersion)
 	if m.QosLevel == proto.QosExactlyOnce {
@@ -413,7 +555,18 @@ func (c *ClientConn) Publish(m *proto.Publish) {
 		c.outgoingQoS2[m.MessageId] = m
 		c.qosMu.Unlock()
 	}
-	c.out <- job{m: m}
+	if err := c.sync(m); err != nil {
+		if allocated {
+			c.releaseid(m.MessageId)
+		}
+		if m.QosLevel == proto.QosExactlyOnce {
+			c.qosMu.Lock()
+			delete(c.outgoingQoS2, m.MessageId)
+			c.qosMu.Unlock()
+		}
+		return err
+	}
+	return nil
 }
 
 // sync sends a message and blocks until it was actually sent.

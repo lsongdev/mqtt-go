@@ -2,6 +2,7 @@ package proto
 
 import (
 	"bytes"
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -105,18 +106,18 @@ func TestV4ControlPacketsRoundTrip(t *testing.T) {
 func TestAllPropertyWireTypesRoundTrip(t *testing.T) {
 	props := Properties{}.
 		Add(PropertyPayloadFormatIndicator, byte(1)).
-		Add(PropertyReceiveMaximum, uint16(10)).
-		Add(PropertySessionExpiryInterval, uint32(20)).
+		Add(PropertyTopicAlias, uint16(10)).
+		Add(PropertyMessageExpiryInterval, uint32(20)).
 		Add(PropertySubscriptionIdentifier, VarInt(321)).
 		Add(PropertyCorrelationData, []byte{1, 2, 3}).
 		Add(PropertyContentType, "text/plain").
 		Add(PropertyUser, StringPair{Key: "a", Value: "b"})
-	m := &Auth{Header: Header{Version: Version5}, ReasonCode: 0x18, Properties: props}
+	m := &Publish{Header: Header{Version: Version5}, TopicName: "a", Properties: props, Payload: BytesPayload("x")}
 	decoded, err := DecodeOneMessage(bytes.NewReader(encodePacket(t, m)), &DecodeOptions{Version: Version5})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(decoded.(*Auth).Properties, props) {
+	if !reflect.DeepEqual(decoded.(*Publish).Properties, props) {
 		t.Fatalf("properties: %#v", decoded)
 	}
 }
@@ -127,6 +128,33 @@ func TestTruncatedPacketReturnsError(t *testing.T) {
 		if _, err := DecodeOneMessage(bytes.NewReader(input), nil); err == nil {
 			t.Fatalf("accepted %x", input)
 		}
+	}
+}
+
+func TestRejectsNonCanonicalVariableByteInteger(t *testing.T) {
+	// Remaining Length 0 encoded using two bytes is malformed.
+	if _, err := DecodeOneMessage(bytes.NewReader([]byte{0xC0, 0x80, 0x00}), nil); err == nil {
+		t.Fatal("accepted overlong Remaining Length")
+	}
+}
+
+func TestRejectsReservedConnAckFlags(t *testing.T) {
+	if _, err := DecodeOneMessage(bytes.NewReader([]byte{0x20, 0x02, 0x02, 0x00}), nil); err == nil {
+		t.Fatal("accepted CONNACK with reserved acknowledge flags")
+	}
+}
+
+func TestRejectsInvalidWillTopicOnDecode(t *testing.T) {
+	packet := []byte{
+		0x10, 0x16,
+		0x00, 0x04, 'M', 'Q', 'T', 'T',
+		0x04, 0x06, 0x00, 0x00,
+		0x00, 0x01, 'c',
+		0x00, 0x05, 'b', 'a', 'd', '/', '+',
+		0x00, 0x00,
+	}
+	if _, err := DecodeOneMessage(bytes.NewReader(packet), nil); err == nil {
+		t.Fatal("accepted wildcard in Will Topic")
 	}
 }
 
@@ -145,5 +173,149 @@ func TestPropertyTypeIsChecked(t *testing.T) {
 	m := &Disconnect{Header: Header{Version: Version5}, Properties: Properties{}.Add(PropertySessionExpiryInterval, "wrong")}
 	if err := m.Encode(new(bytes.Buffer)); err == nil {
 		t.Fatal("accepted wrong property value type")
+	}
+}
+
+func TestRejectsZeroPacketIdentifiers(t *testing.T) {
+	cases := []Message{
+		&Publish{Header: Header{QosLevel: QosAtLeastOnce}, TopicName: "a", MessageId: 0, Payload: BytesPayload("x")},
+		&PubAck{MessageId: 0},
+		&Subscribe{MessageId: 0, Topics: []TopicQos{{Topic: "a"}}},
+		&Unsubscribe{MessageId: 0, Topics: []string{"a"}},
+	}
+	for _, packet := range cases {
+		if err := packet.Encode(new(bytes.Buffer)); err == nil {
+			t.Fatalf("encoded %T with packet identifier 0", packet)
+		}
+	}
+
+	// QoS 1 PUBLISH with Packet Identifier 0.
+	if _, err := DecodeOneMessage(bytes.NewReader([]byte{0x32, 5, 0, 1, 'a', 0, 0}), nil); err == nil {
+		t.Fatal("decoded PUBLISH with packet identifier 0")
+	}
+}
+
+func TestSubscribeAndUnsubscribeRequirePayload(t *testing.T) {
+	if err := (&Subscribe{MessageId: 1}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("encoded empty SUBSCRIBE")
+	}
+	if err := (&Unsubscribe{MessageId: 1}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("encoded empty UNSUBSCRIBE")
+	}
+	if _, err := DecodeOneMessage(bytes.NewReader([]byte{0x82, 2, 0, 1}), nil); err == nil {
+		t.Fatal("decoded empty SUBSCRIBE")
+	}
+	if _, err := DecodeOneMessage(bytes.NewReader([]byte{0xA2, 2, 0, 1}), nil); err == nil {
+		t.Fatal("decoded empty UNSUBSCRIBE")
+	}
+}
+
+func TestDecodePacketSizeLimitBeforeAllocation(t *testing.T) {
+	_, err := DecodeOneMessage(bytes.NewReader([]byte{0x30, 9}), &DecodeOptions{MaxPacketSize: 8})
+	if !errors.Is(err, ErrPacketTooLarge) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func FuzzDecodeOneMessage(f *testing.F) {
+	seeds := [][]byte{
+		{0xC0, 0x00},
+		{0xD0, 0x00},
+		{0x30, 0x03, 0x00, 0x01, 'a'},
+		{0x10, 0x0C, 0x00, 0x04, 'M', 'Q', 'T', 'T', 0x04, 0x02, 0x00, 0x00, 0x00, 0x00},
+	}
+	for _, seed := range seeds {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("decoder panicked for %x: %v", data, recovered)
+			}
+		}()
+		_, _ = DecodeOneMessage(bytes.NewReader(data), &DecodeOptions{MaxPacketSize: 1 << 20})
+	})
+}
+
+func TestMQTT5PropertyContextAndValueValidation(t *testing.T) {
+	if err := (&Auth{
+		Header:     Header{Version: Version5},
+		Properties: Properties{}.Add(PropertySessionExpiryInterval, uint32(1)),
+	}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("AUTH accepted CONNECT-only property")
+	}
+	if err := (&ConnAck{
+		Header: Header{Version: Version5},
+		Properties: Properties{}.
+			Add(PropertyMaximumQoS, byte(1)).
+			Add(PropertyMaximumQoS, byte(1)),
+	}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("CONNACK accepted duplicate Maximum QoS")
+	}
+	if err := (&Connect{
+		ProtocolName: PROTOCOL_5_0, ProtocolVersion: 5, CleanSession: true,
+		ClientId: "client", Properties: Properties{}.Add(PropertyReceiveMaximum, uint16(0)),
+	}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("CONNECT accepted Receive Maximum 0")
+	}
+	if err := (&Publish{
+		Header: Header{Version: Version5}, TopicName: "a",
+		Properties: Properties{}.Add(PropertyTopicAlias, uint16(0)),
+	}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("PUBLISH accepted Topic Alias 0")
+	}
+}
+
+func TestConnectBinaryPasswordAndWillPayloadRoundTrip(t *testing.T) {
+	password := string([]byte{0xff, 0x00, 0xfe})
+	will := string([]byte{0x00, 0xff, 0x01})
+	original := &Connect{
+		ProtocolName: PROTOCOL_3_1_1, ProtocolVersion: 4,
+		CleanSession: true, ClientId: "binary",
+		UsernameFlag: true, Username: "user",
+		PasswordFlag: true, Password: password,
+		WillFlag: true, WillTopic: "will/topic", WillMessage: will,
+	}
+	decoded, err := DecodeOneMessage(bytes.NewReader(encodePacket(t, original)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decoded.(*Connect)
+	if got.Password != password || got.WillMessage != will {
+		t.Fatalf("binary fields changed: password=%x will=%x", []byte(got.Password), []byte(got.WillMessage))
+	}
+}
+
+func TestTopicValidation(t *testing.T) {
+	if err := (&Publish{TopicName: "bad/+", Payload: BytesPayload("x")}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("accepted wildcard in topic name")
+	}
+	if err := (&Subscribe{MessageId: 1, Topics: []TopicQos{{Topic: "a/#/b"}}}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("accepted malformed topic filter")
+	}
+	if err := (&Publish{
+		Header: Header{Version: Version5}, TopicName: "",
+		Properties: Properties{}.Add(PropertyTopicAlias, uint16(1)),
+		Payload:    BytesPayload("x"),
+	}).Encode(new(bytes.Buffer)); err != nil {
+		t.Fatalf("rejected MQTT 5 topic alias publish: %v", err)
+	}
+	if err := (&Publish{Header: Header{Version: Version5}, TopicName: "", Payload: BytesPayload("x")}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("accepted empty topic without alias")
+	}
+	if err := (&Publish{TopicName: string([]byte{0xff}), Payload: BytesPayload("x")}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("accepted invalid UTF-8 topic")
+	}
+}
+
+func TestPublishRejectsInvalidStreamingPayloadSize(t *testing.T) {
+	for _, size := range []int{-1, MaxPayloadSize + 1} {
+		message := &Publish{
+			TopicName: "stream",
+			Payload:   &StreamedPayload{N: size, EncodingSource: bytes.NewReader(nil)},
+		}
+		if err := message.Encode(new(bytes.Buffer)); err == nil {
+			t.Fatalf("accepted payload size %d", size)
+		}
 	}
 }

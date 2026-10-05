@@ -78,13 +78,17 @@ import (
 )
 
 var (
-	badMsgTypeError        = errors.New("mqtt: message type is invalid")
-	badQosError            = errors.New("mqtt: QoS is invalid")
-	badWillQosError        = errors.New("mqtt: will QoS is invalid")
-	badLengthEncodingError = errors.New("mqtt: remaining length field exceeded maximum of 4 bytes")
-	badReturnCodeError     = errors.New("mqtt: is invalid")
-	dataExceedsPacketError = errors.New("mqtt: data exceeds packet length")
-	msgTooLongError        = errors.New("mqtt: message is too long")
+	badMsgTypeError          = errors.New("mqtt: message type is invalid")
+	badQosError              = errors.New("mqtt: QoS is invalid")
+	badWillQosError          = errors.New("mqtt: will QoS is invalid")
+	badLengthEncodingError   = errors.New("mqtt: remaining length field exceeded maximum of 4 bytes")
+	badReturnCodeError       = errors.New("mqtt: is invalid")
+	dataExceedsPacketError   = errors.New("mqtt: data exceeds packet length")
+	msgTooLongError          = errors.New("mqtt: message is too long")
+	badPacketIdentifierError = errors.New("mqtt: packet identifier must be non-zero")
+
+	// ErrPacketTooLarge is returned when a decoder packet-size limit is exceeded.
+	ErrPacketTooLarge = errors.New("mqtt: packet exceeds configured maximum size")
 )
 
 const (
@@ -144,7 +148,10 @@ type VersionedDecoderConfig interface {
 // DecodeOptions is the standard decoder configuration. Version defaults to
 // Version311 when left unset, preserving the behaviour of older callers.
 type DecodeOptions struct {
-	Version        ProtocolVersion
+	Version ProtocolVersion
+	// MaxPacketSize limits the MQTT Remaining Length accepted by the decoder.
+	// Zero keeps the protocol maximum. The check happens before payload allocation.
+	MaxPacketSize  int
 	PayloadFactory func(*Publish, io.Reader, int) (Payload, error)
 }
 
@@ -160,6 +167,13 @@ func (o *DecodeOptions) MakePayload(msg *Publish, r io.Reader, n int) (Payload, 
 		return o.PayloadFactory(msg, r, n)
 	}
 	return make(BytesPayload, n), nil
+}
+
+func decoderPacketLimit(c DecoderConfig) int {
+	if o, ok := c.(*DecodeOptions); ok && o != nil {
+		return o.MaxPacketSize
+	}
+	return 0
 }
 
 func decoderVersion(c DecoderConfig) ProtocolVersion {
@@ -206,6 +220,9 @@ func DecodeOneMessage(r io.Reader, config DecoderConfig) (msg Message, err error
 
 	if config == nil {
 		config = DefaultDecoderConfig{}
+	}
+	if limit := decoderPacketLimit(config); limit > 0 && int64(packetRemaining) > int64(limit) {
+		return nil, ErrPacketTooLarge
 	}
 
 	return msg, msg.Decode(r, hdr, packetRemaining, config)

@@ -283,11 +283,8 @@ func (c *incomingConn) deliverSessionQueue() {
 	queued := append([]StoredMessage(nil), c.session.Queue...)
 	c.svr.sessionsMu.Unlock()
 	for _, stored := range queued {
-		if stored.PacketID >= c.nextID {
-			c.nextID = stored.PacketID + 1
-			if c.nextID == 0 {
-				c.nextID = 1
-			}
+		if stored.PacketID != 0 {
+			c.reserveMessageID(stored.PacketID)
 		}
 		if stored.Stage == 1 && stored.QoS == proto.QosExactlyOnce && stored.PacketID != 0 {
 			message := stored.publish()
@@ -307,6 +304,9 @@ func (c *incomingConn) deliverSessionQueue() {
 		message.DupFlag = stored.PacketID != 0
 		if message.QosLevel.HasId() && message.MessageId == 0 {
 			message.MessageId = c.nextMessageID()
+			if message.MessageId == 0 {
+				return
+			}
 			c.svr.markSessionDelivery(c.session, stored.ID, message.MessageId, 0)
 		}
 		c.trackAndSubmit(message, stored.ID)
@@ -314,8 +314,15 @@ func (c *incomingConn) deliverSessionQueue() {
 }
 
 func (c *incomingConn) trackAndSubmit(message *proto.Publish, storedID uint64) {
-	if message.QosLevel.HasId() && message.MessageId == 0 {
-		message.MessageId = c.nextMessageID()
+	if message.QosLevel.HasId() {
+		if message.MessageId == 0 {
+			message.MessageId = c.nextMessageID()
+			if message.MessageId == 0 {
+				return
+			}
+		} else {
+			c.reserveMessageID(message.MessageId)
+		}
 	}
 	c.qosMu.Lock()
 	if message.QosLevel == proto.QosExactlyOnce {
@@ -329,6 +336,7 @@ func (c *incomingConn) trackAndSubmit(message *proto.Publish, storedID uint64) {
 }
 
 func (c *incomingConn) ackOutgoing(packetID uint16) {
+	c.releaseMessageID(packetID)
 	c.qosMu.Lock()
 	storedID := c.outgoingStored[packetID]
 	delete(c.outgoingStored, packetID)

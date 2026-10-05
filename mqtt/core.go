@@ -14,13 +14,19 @@ var ConnectionErrors = [6]error{
 	errors.New("connection refused: unacceptable protocol version"),
 	errors.New("connection refused: identifier rejected"),
 	errors.New("connection refused: server unavailable"),
-	errors.New("connection refused: bad user name or password"),
-	errors.New("connection refused: not authorized"),
+	ErrBadCredentials,
+	ErrNotAuthorized,
 }
 
 // ErrClientClosed is returned when an operation cannot complete because the
 // client transport has closed.
+const DefaultMaxPacketSize = 16 << 20
+
 var ErrClientClosed = errors.New("mqtt: client connection closed")
+
+// ErrPacketIdentifiersExhausted is returned when all MQTT packet identifiers
+// are still in use. Packet identifier 0 is never valid on the wire.
+var ErrPacketIdentifiersExhausted = errors.New("mqtt: packet identifiers exhausted")
 
 type retainFlag bool
 type dupFlag bool
