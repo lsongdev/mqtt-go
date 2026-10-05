@@ -78,13 +78,13 @@ import (
 )
 
 var (
-	badMsgTypeError        = errors.New("mqtt: message type is invalid")
-	badQosError            = errors.New("mqtt: QoS is invalid")
-	badWillQosError        = errors.New("mqtt: will QoS is invalid")
-	badLengthEncodingError = errors.New("mqtt: remaining length field exceeded maximum of 4 bytes")
-	badReturnCodeError     = errors.New("mqtt: is invalid")
-	dataExceedsPacketError = errors.New("mqtt: data exceeds packet length")
-	msgTooLongError        = errors.New("mqtt: message is too long")
+	badMsgTypeError          = errors.New("mqtt: message type is invalid")
+	badQosError              = errors.New("mqtt: QoS is invalid")
+	badWillQosError          = errors.New("mqtt: will QoS is invalid")
+	badLengthEncodingError   = errors.New("mqtt: remaining length field exceeded maximum of 4 bytes")
+	badReturnCodeError       = errors.New("mqtt: is invalid")
+	dataExceedsPacketError   = errors.New("mqtt: data exceeds packet length")
+	msgTooLongError          = errors.New("mqtt: message is too long")
 	badPacketIdentifierError = errors.New("mqtt: packet identifier must be non-zero")
 
 	// ErrPacketTooLarge is returned when a decoder packet-size limit is exceeded.
@@ -148,7 +148,7 @@ type VersionedDecoderConfig interface {
 // DecodeOptions is the standard decoder configuration. Version defaults to
 // Version311 when left unset, preserving the behaviour of older callers.
 type DecodeOptions struct {
-	Version        ProtocolVersion
+	Version ProtocolVersion
 	// MaxPacketSize limits the MQTT Remaining Length accepted by the decoder.
 	// Zero keeps the protocol maximum. The check happens before payload allocation.
 	MaxPacketSize  int
