@@ -43,6 +43,7 @@ func main() {
         KeepAlive:       30,
         EnableQoS2:      true,      // optional
         SessionExpiry:   time.Hour, // v5 persistent session
+        MaxPacketSize:   4 << 20,  // optional; runtime default is 16 MiB
     })
     if err != nil {
         log.Fatal(err)
@@ -55,10 +56,12 @@ func main() {
     }})
     fmt.Printf("subscribed: %#v\n", ack)
 
-    client.Publish(&proto.Publish{
+    if err := client.Publish(&proto.Publish{
         TopicName: "example/hello",
         Payload:   proto.BytesPayload("hello"),
-    })
+    }); err != nil {
+        log.Fatal(err)
+    }
 }
 ```
 
@@ -104,6 +107,7 @@ broker, err := mqtt.NewServerWithOptions(mqtt.ServerOptions{
     EnablePersistentSessions:  true,
     EnableSharedSubscriptions: true,
     SessionStore:              store,
+    MaxPacketSize:             8 << 20,
 })
 if err != nil {
     log.Fatal(err)
@@ -112,7 +116,9 @@ defer broker.Close()
 ```
 
 Providing `SessionStore` also enables persistent sessions. Leave it nil for
-in-memory sessions, or omit all options for the original lightweight profile.
+in-memory sessions. Client and broker runtimes reject packets larger than
+`mqtt.DefaultMaxPacketSize` (16 MiB) by default, before payload allocation.
+Set `MaxPacketSize` explicitly when the application requires a different bound.
 
 ## Protocol support
 
@@ -131,8 +137,10 @@ in-memory sessions, or omit all options for the original lightweight profile.
 
 The packet codec is in `proto`. MQTT 5 properties are represented by an
 ordered `proto.Properties` slice, preserving repeatable properties such as
-User Property and Subscription Identifier. Values are type checked during
-encoding.
+User Property and Subscription Identifier. The codec validates fixed-header
+flags, packet identifiers, UTF-8 and topic syntax, canonical Variable Byte
+Integers, property value types, duplicate rules, and packet-specific MQTT 5
+property contexts while decoding and encoding.
 
 ```go
 props := proto.Properties{}.
@@ -165,21 +173,46 @@ message := &proto.Publish{
   returns reason code `0x9e` and the broker advertises the feature as unavailable.
 
 For persistent broker-to-client QoS 2 delivery, the Packet ID and PUBLISH or
-PUBREL stage are durable and resume after reconnect. Client-to-broker handshake
-state is connection-local; after a transport loss the client retransmits its
-PUBLISH/PUBREL as required by MQTT.
+PUBREL stage are durable and resume after reconnect. The client intentionally
+does not implement an automatic reconnect policy; applications decide when and
+how to reconnect.
+
+## Architecture
+
+The implementation keeps wire semantics separate from runtime state:
+
+- `proto/` owns MQTT packet encoding, decoding, and protocol validation.
+- `mqtt/` owns client/broker state machines, ordered routing, sessions, QoS,
+  persistence, and transports.
+- `cmd/mqtt/` is only the example/debug executable.
+
+See [docs/architecture.md](docs/architecture.md) for the runtime invariants.
 
 ## Testing
 
 ```sh
+gofmt -w .
+go vet ./...
 go test ./...
 go test -race ./...
+go test -fuzz=FuzzDecodeOneMessage ./proto
 ```
 
-The suite covers exact v4/v5 wire encodings, MQTT 5 properties and control
-packets, malformed fixed headers, optional QoS 2 for v4/v5, shared-subscription
-round robin, v4 session resume, SQLite restart recovery, expiry, and offline
-queue acknowledgement.
+CI enforces formatting, vet, unit/integration tests, and the race detector.
+The suite covers exact v4/v5 wire encodings, malformed and truncated packets,
+MQTT 5 property contexts and value constraints, topic/filter syntax, packet
+identifier wraparound, packet-size limits, retained-message semantics,
+Keep Alive, optional QoS 2, shared subscriptions, session resume, SQLite
+restart recovery, expiry, and offline queue acknowledgement. The protocol
+decoder also has a fuzz target that asserts arbitrary input does not panic.
+
+## Scope
+
+The broker currently focuses on messaging, QoS, retained messages, sessions,
+and shared subscriptions. It does not yet implement broker-side authentication
+or Last Will delivery, and the client does not automatically reconnect. Keeping
+these boundaries explicit avoids presenting partial semantics as full protocol
+support.
 
 ## License
 
