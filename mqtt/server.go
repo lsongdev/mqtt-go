@@ -118,6 +118,7 @@ func (s *Server) newIncomingConn(conn net.Conn) *incomingConn {
 		incomingQoS2:   make(map[uint16]*proto.Publish),
 		outgoingQoS2:   make(map[uint16]*proto.Publish),
 		outgoingStored: make(map[uint16]uint64),
+		packetIDs:      make(map[uint16]struct{}),
 		closed:         make(chan struct{}),
 		done:           make(chan struct{}),
 	}
@@ -189,6 +190,7 @@ type incomingConn struct {
 	decode         *proto.DecodeOptions
 	nextID         uint16
 	idMu           sync.Mutex
+	packetIDs       map[uint16]struct{}
 	session        *sessionState
 	persistent     bool
 	incomingQoS2   map[uint16]*proto.Publish
@@ -334,18 +336,21 @@ func (c *incomingConn) reader() {
 			}
 			c.clientid = m.ClientId
 			c.keepAlive = time.Duration(m.KeepAliveTimer) * time.Second
-			// Disconnect existing connections.
-			if existing := c.add(); existing != nil {
-				disconnect := &proto.Disconnect{}
-				r := existing.submitSync(disconnect)
-				_ = r.wait()
-				<-existing.done
-				c.svr.clientsMu.Lock()
-				c.svr.clients[c.clientid] = c
-				c.svr.clientsMu.Unlock()
-			}
 			sessionPresent := false
 			if rc == proto.RetCodeAccepted {
+				// Only an accepted CONNECT may take over an existing ClientID.
+				if existing := c.add(); existing != nil {
+					if existing.version == proto.Version5 {
+						r := existing.submitSync(&proto.Disconnect{ReasonCode: 0x8e})
+						_ = r.wait()
+					} else {
+						existing.stop()
+					}
+					<-existing.done
+					c.svr.clientsMu.Lock()
+					c.svr.clients[c.clientid] = c
+					c.svr.clientsMu.Unlock()
+				}
 				sessionPresent = c.svr.attachSession(c, m)
 			}
 
@@ -1066,12 +1071,48 @@ func (ip intPayload) Size() int {
 func (c *incomingConn) nextMessageID() uint16 {
 	c.idMu.Lock()
 	defer c.idMu.Unlock()
-	id := c.nextID
-	c.nextID++
-	if c.nextID == 0 {
-		c.nextID = 1
+	for i := 0; i < 65535; i++ {
+		if c.nextID == 0 {
+			c.nextID = 1
+		}
+		id := c.nextID
+		c.nextID++
+		if _, used := c.packetIDs[id]; used {
+			continue
+		}
+		c.packetIDs[id] = struct{}{}
+		return id
 	}
-	return id
+	c.stop()
+	return 0
+}
+
+func (c *incomingConn) reserveMessageID(id uint16) bool {
+	if id == 0 {
+		return false
+	}
+	c.idMu.Lock()
+	defer c.idMu.Unlock()
+	if _, used := c.packetIDs[id]; used {
+		return true
+	}
+	c.packetIDs[id] = struct{}{}
+	if id >= c.nextID {
+		c.nextID = id + 1
+		if c.nextID == 0 {
+			c.nextID = 1
+		}
+	}
+	return true
+}
+
+func (c *incomingConn) releaseMessageID(id uint16) {
+	if id == 0 {
+		return
+	}
+	c.idMu.Lock()
+	delete(c.packetIDs, id)
+	c.idMu.Unlock()
 }
 
 type stats struct {
