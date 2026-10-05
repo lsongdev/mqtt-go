@@ -293,6 +293,7 @@ func (c *incomingConn) submit(m proto.Message) bool {
 // Queue a message, returns a channel that will be readable
 // when the message is sent.
 func (c *incomingConn) submitSync(m proto.Message) receipt {
+	proto.SetVersion(m, c.version)
 	r := make(receipt, 1)
 	j := job{m: m, r: r}
 	select {
