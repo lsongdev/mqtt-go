@@ -450,3 +450,73 @@ func TestCleanStartPublishesPendingWillImmediately(t *testing.T) {
 		t.Fatalf("will payload: %q", got.Payload)
 	}
 }
+
+func TestAutomaticReconnectReplaysSubscriptions(t *testing.T) {
+	server := NewServer()
+	defer server.Close()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() { _ = server.Serve(listener) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	client, err := DialWithReconnect(ctx, listener.Addr().String(), ClientOptions{
+		ClientID:   "reconnect-client",
+		CleanStart: true,
+	}, ReconnectOptions{
+		MinDelay:    10 * time.Millisecond,
+		MaxDelay:    50 * time.Millisecond,
+		DialTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if ack := client.Subscribe([]proto.TopicQos{{Topic: "reconnect/#"}}); ack == nil {
+		t.Fatal("subscribe failed")
+	}
+
+	server.clientsMu.Lock()
+	first := server.clients["reconnect-client"]
+	server.clientsMu.Unlock()
+	if first == nil {
+		t.Fatal("initial broker connection missing")
+	}
+	first.stop()
+
+	waitUntil(t, func() bool {
+		server.clientsMu.Lock()
+		defer server.clientsMu.Unlock()
+		current := server.clients["reconnect-client"]
+		return current != nil && current != first && client.Connected()
+	})
+
+	publisher, err := Dial(context.Background(), listener.Addr().String(), ClientOptions{
+		ClientID:   "reconnect-publisher",
+		CleanStart: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publisher.Disconnect()
+
+	if err := publisher.Publish(&proto.Publish{
+		TopicName: "reconnect/test",
+		Payload:   proto.BytesPayload("ok"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-client.Incoming:
+		if got.TopicName != "reconnect/test" || string(got.Payload.(proto.BytesPayload)) != "ok" {
+			t.Fatalf("message: %#v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconnected subscription did not receive publish")
+	}
+}
