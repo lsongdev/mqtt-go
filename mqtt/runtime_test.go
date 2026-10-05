@@ -63,12 +63,12 @@ func TestDollarTopicDoesNotMatchLeadingWildcard(t *testing.T) {
 	system := pipeClient(t, server, ClientOptions{ClientID: "system", CleanStart: true})
 	pub := pipeClient(t, server, ClientOptions{ClientID: "publisher", CleanStart: true})
 	general.Subscribe([]proto.TopicQos{{Topic: "#"}})
-	system.Subscribe([]proto.TopicQos{{Topic: "$SYS/#"}})
+	system.Subscribe([]proto.TopicQos{{Topic: "$private/#"}})
 
-	if err := pub.Publish(&proto.Publish{TopicName: "$SYS/test", Payload: proto.BytesPayload("ok")}); err != nil {
+	if err := pub.Publish(&proto.Publish{TopicName: "$private/test", Payload: proto.BytesPayload("ok")}); err != nil {
 		t.Fatal(err)
 	}
-	if got := receivePublish(t, system); got.TopicName != "$SYS/test" {
+	if got := receivePublish(t, system); got.TopicName != "$private/test" {
 		t.Fatalf("system subscriber got %q", got.TopicName)
 	}
 	select {
