@@ -1,10 +1,8 @@
 package mqtt
 
 import (
-	"crypto/tls"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -28,14 +26,6 @@ var wsUpgrader = websocket.Upgrader{
 	HandshakeTimeout: 10 * time.Second,
 	// 支持 MQTT WebSocket 子协议
 	Subprotocols: []string{"mqttv3.1", "mqtt"},
-}
-
-// WebSocketConfig holds the configuration for WebSocket connections
-type WebSocketConfig struct {
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
-	Path         string
-	TLSConfig    *tls.Config
 }
 
 // NewWebSocketConn creates a new WebSocketConn.
@@ -74,44 +64,27 @@ func (w *WebSocketConn) Read(p []byte) (int, error) {
 	}
 }
 
-// Write implements io.Writer interface
+// Write implements io.Writer interface.
 func (w *WebSocketConn) Write(p []byte) (n int, err error) {
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
+
 	writer, err := w.NextWriter(websocket.BinaryMessage)
 	if err != nil {
-		closeErr, ok := err.(*websocket.CloseError)
-		if ok {
-			log.Printf("WebSocket: Write close error for %s: %v", w.RemoteAddr(), err)
-			if closeErr.Code == websocket.CloseNormalClosure ||
-				closeErr.Code == websocket.CloseGoingAway {
-				return 0, io.EOF
-			}
-			if closeErr.Code == websocket.CloseAbnormalClosure ||
-				closeErr.Code == websocket.CloseNoStatusReceived {
-				return 0, io.EOF
-			}
-		}
-		if err.Error() == "use of closed network connection" {
-			log.Printf("WebSocket: Connection closed when writing to %s", w.RemoteAddr())
+		if _, ok := err.(*websocket.CloseError); ok {
 			return 0, io.EOF
 		}
-		log.Printf("WebSocket: Write error for %s: %v", w.RemoteAddr(), err)
 		return 0, err
 	}
-
 	n, err = writer.Write(p)
 	if err != nil {
-		log.Printf("WebSocket: Error writing message to %s: %v", w.RemoteAddr(), err)
+		_ = writer.Close()
 		return n, err
 	}
-	log.Printf("WebSocket: Wrote %d bytes to %s", n, w.RemoteAddr())
-
-	err = writer.Close()
-	if err != nil {
-		log.Printf("WebSocket: Error closing writer for %s: %v", w.RemoteAddr(), err)
+	if err := writer.Close(); err != nil {
+		return n, err
 	}
-	return n, err
+	return n, nil
 }
 
 // Close implements io.Closer interface
@@ -137,7 +110,6 @@ func (w *WebSocketConn) SetDeadline(t time.Time) error {
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	wsConn, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("mqtt: websocket upgrade: %v", err)
 		return
 	}
 	// Bound a single WebSocket frame. MQTT packet limits are enforced by the
