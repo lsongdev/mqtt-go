@@ -46,6 +46,7 @@ type ClientConn struct {
 	connack         chan *proto.ConnAck
 	suback          chan *proto.SubAck
 	unsuback        chan *proto.UnsubAck
+	pingresp        chan struct{}
 	Dump            bool                  // When true, dump the messages in and out.
 	ProtocolVersion proto.ProtocolVersion // Defaults to MQTT 3.1.1 (level 4).
 	decode          *proto.DecodeOptions
@@ -101,6 +102,7 @@ func NewClientConn(c net.Conn) *ClientConn {
 		connack:         make(chan *proto.ConnAck),
 		suback:          make(chan *proto.SubAck),
 		unsuback:        make(chan *proto.UnsubAck),
+		pingresp:        make(chan struct{}, 1),
 		ProtocolVersion: proto.Version311,
 		decode:          decode,
 		incomingQoS2:    make(map[uint16]*proto.Publish),
@@ -216,6 +218,10 @@ func (c *ClientConn) reader() {
 			c.releaseid(m.MessageId)
 			c.unsuback <- m
 		case *proto.PingResp:
+			select {
+			case c.pingresp <- struct{}{}:
+			default:
+			}
 			continue
 		case *proto.Disconnect:
 			return
@@ -417,7 +423,27 @@ func (c *ClientConn) keepAliveLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			if !c.send(&proto.PingReq{}) {
+			// Discard a stale response before starting a new ping exchange.
+			select {
+			case <-c.pingresp:
+			default:
+			}
+			if err := c.sync(&proto.PingReq{}); err != nil {
+				return
+			}
+			timer := time.NewTimer(c.keepAlive)
+			select {
+			case <-c.pingresp:
+				if !timer.Stop() {
+					<-timer.C
+				}
+			case <-timer.C:
+				_ = c.conn.Close()
+				return
+			case <-c.closed:
+				if !timer.Stop() {
+					<-timer.C
+				}
 				return
 			}
 		case <-c.closed:
