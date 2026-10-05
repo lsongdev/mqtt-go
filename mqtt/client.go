@@ -73,6 +73,16 @@ type ClientOptions struct {
 	MaxPacketSize   int
 }
 
+func propertyString(properties proto.Properties, id proto.PropertyID) (string, bool) {
+	for _, p := range properties {
+		if p.ID == id {
+			value, ok := p.Value.(string)
+			return value, ok
+		}
+	}
+	return "", false
+}
+
 func (o ClientOptions) normalized() ClientOptions {
 	if o.ProtocolVersion == 0 {
 		o.ProtocolVersion = proto.Version311
@@ -147,7 +157,6 @@ func (c *ClientConn) reader() {
 	}()
 
 	for {
-		// TODO: timeout (first message and/or keepalives)
 		m, err := proto.DecodeOneMessage(c.conn, c.decode)
 		if err != nil {
 			if err == io.EOF {
@@ -252,7 +261,6 @@ func (c *ClientConn) writer() {
 			log.Printf("dump out: %T", job.m)
 		}
 
-		// TODO: write timeout
 		proto.SetVersion(job.m, c.ProtocolVersion)
 		err := job.m.Encode(c.conn)
 		if job.r != nil {
@@ -281,8 +289,8 @@ func (c *ClientConn) Connect(user, pass string) error {
 // ConnectWithOptions sends a versioned CONNECT packet on an existing transport.
 func (c *ClientConn) ConnectWithOptions(options ClientOptions) error {
 	options = options.normalized()
-	// TODO: Keepalive timer
-	if options.ClientID == "" {
+	requestedAssignedID := options.ClientID == "" && options.ProtocolVersion == proto.Version5
+	if options.ClientID == "" && options.ProtocolVersion != proto.Version5 {
 		options.ClientID = fmt.Sprint(cliRand.Int63())
 	}
 	c.ClientId = options.ClientID
@@ -330,6 +338,14 @@ func (c *ClientConn) ConnectWithOptions(options ClientOptions) error {
 	}
 	if ack.ReturnCode == proto.RetCodeAccepted {
 		c.SessionPresent = ack.SessionPresent
+		if requestedAssignedID {
+			assigned, ok := propertyString(ack.Properties, proto.PropertyAssignedClientIdentifier)
+			if !ok || assigned == "" {
+				_ = c.conn.Close()
+				return fmt.Errorf("mqtt: server accepted empty client id without Assigned Client Identifier")
+			}
+			c.ClientId = assigned
+		}
 		if options.KeepAlive > 0 {
 			c.keepAlive = time.Duration(options.KeepAlive) * time.Second
 			c.keepAliveOnce.Do(func() { go c.keepAliveLoop() })
