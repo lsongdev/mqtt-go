@@ -68,6 +68,7 @@ type ClientOptions struct {
 	CleanStart      bool
 	KeepAlive       uint16
 	Properties      proto.Properties
+	Will            *Will
 	EnableQoS2      bool
 	SessionExpiry   time.Duration
 	MaxPacketSize   int
@@ -306,6 +307,16 @@ func (c *ClientConn) ConnectWithOptions(options ClientOptions) error {
 		KeepAliveTimer:  options.KeepAlive,
 		Properties:      options.Properties,
 	}
+	if options.Will != nil {
+		req.WillFlag = true
+		req.WillQos = options.Will.QoS
+		req.WillRetain = options.Will.Retain
+		req.WillTopic = options.Will.Topic
+		req.WillMessage = string(options.Will.Payload)
+		if options.ProtocolVersion == proto.Version5 {
+			req.WillProperties = append(proto.Properties(nil), options.Will.Properties...)
+		}
+	}
 	if options.Username != "" {
 		req.UsernameFlag = true
 		req.Username = options.Username
@@ -354,6 +365,12 @@ func (c *ClientConn) ConnectWithOptions(options ClientOptions) error {
 	}
 	if int(ack.ReturnCode) < len(ConnectionErrors) {
 		return ConnectionErrors[ack.ReturnCode]
+	}
+	switch ack.ReturnCode {
+	case proto.ReturnCode(0x86):
+		return ErrBadCredentials
+	case proto.ReturnCode(0x87):
+		return ErrNotAuthorized
 	}
 	return fmt.Errorf("connection refused: reason code 0x%02x", uint8(ack.ReturnCode))
 }
