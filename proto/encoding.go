@@ -2,8 +2,32 @@ package proto
 
 import (
 	"bytes"
+	"errors"
 	"io"
+	"unicode/utf8"
 )
+
+func validateLengthPrefixed(n int) error {
+	if n > int(^uint16(0)) {
+		return errors.New("mqtt: length-prefixed field exceeds 65535 bytes")
+	}
+	return nil
+}
+
+func validateUTF8String(s string) error {
+	if err := validateLengthPrefixed(len(s)); err != nil {
+		return err
+	}
+	if !utf8.ValidString(s) {
+		return errors.New("mqtt: invalid UTF-8 string")
+	}
+	for _, r := range s {
+		if r == 0 || (r >= 0xFDD0 && r <= 0xFDEF) || (r&0xFFFF == 0xFFFE) || (r&0xFFFF == 0xFFFF) {
+			return errors.New("mqtt: UTF-8 string contains prohibited code point")
+		}
+	}
+	return nil
+}
 
 func getUint8(r io.Reader, packetRemaining *int32) uint8 {
 	if *packetRemaining < 1 {
@@ -71,7 +95,11 @@ func getString(r io.Reader, packetRemaining *int32) string {
 	}
 	*packetRemaining -= int32(strLen)
 
-	return string(b)
+	value := string(b)
+	if err := validateUTF8String(value); err != nil {
+		raiseError(err)
+	}
+	return value
 }
 
 func setUint8(val uint8, buf *bytes.Buffer) {
