@@ -214,6 +214,9 @@ func validateProperties(ctx propertyContext, props Properties) error {
 	if hasAuthData && !hasAuthMethod {
 		return errors.New("mqtt: authentication data requires authentication method")
 	}
+	if ctx == propertiesAuth && !hasAuthMethod {
+		return errors.New("mqtt: AUTH requires authentication method")
+	}
 	return nil
 }
 
