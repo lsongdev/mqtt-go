@@ -127,7 +127,7 @@ var allowedProperties = map[propertyContext]map[PropertyID]struct{}{
 	propertiesSubAck:      propertySet(PropertyReasonString, PropertyUserProperty),
 	propertiesUnsubscribe: propertySet(PropertyUserProperty),
 	propertiesUnsubAck:    propertySet(PropertyReasonString, PropertyUserProperty),
-	propertiesDisconnect: propertySet(PropertySessionExpiryInterval, PropertyReasonString, PropertyUserProperty, PropertyServerReference),
+	propertiesDisconnect:  propertySet(PropertySessionExpiryInterval, PropertyReasonString, PropertyUserProperty, PropertyServerReference),
 	propertiesAuth:        propertySet(PropertyAuthenticationMethod, PropertyAuthenticationData, PropertyReasonString, PropertyUserProperty),
 }
 
