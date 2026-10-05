@@ -22,6 +22,10 @@ var ConnectionErrors = [6]error{
 // client transport has closed.
 var ErrClientClosed = errors.New("mqtt: client connection closed")
 
+// ErrPacketIdentifiersExhausted is returned when all MQTT packet identifiers
+// are still in use. Packet identifier 0 is never valid on the wire.
+var ErrPacketIdentifiersExhausted = errors.New("mqtt: packet identifiers exhausted")
+
 type retainFlag bool
 type dupFlag bool
 
