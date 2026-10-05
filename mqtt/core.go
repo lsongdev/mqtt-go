@@ -20,6 +20,8 @@ var ConnectionErrors = [6]error{
 
 // ErrClientClosed is returned when an operation cannot complete because the
 // client transport has closed.
+const DefaultMaxPacketSize = 16 << 20
+
 var ErrClientClosed = errors.New("mqtt: client connection closed")
 
 // ErrPacketIdentifiersExhausted is returned when all MQTT packet identifiers
