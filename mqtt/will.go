@@ -1,7 +1,6 @@
 package mqtt
 
 import (
-	"sync"
 	"time"
 
 	"github.com/lsongdev/mqtt-go/proto"
@@ -103,13 +102,6 @@ func (s *Server) scheduleWill(c *incomingConn) {
 	}
 
 	pending := &pendingWill{message: message}
-	s.willsMu.Lock()
-	if previous := s.wills[c.clientid]; previous != nil {
-		previous.timer.Stop()
-	}
-	s.wills[c.clientid] = pending
-	s.willsMu.Unlock()
-
 	pending.timer = time.AfterFunc(delay, func() {
 		s.willsMu.Lock()
 		if s.wills[c.clientid] != pending {
@@ -120,6 +112,12 @@ func (s *Server) scheduleWill(c *incomingConn) {
 		s.willsMu.Unlock()
 		s.subs.submit(nil, message)
 	})
+	s.willsMu.Lock()
+	if previous := s.wills[c.clientid]; previous != nil {
+		previous.timer.Stop()
+	}
+	s.wills[c.clientid] = pending
+	s.willsMu.Unlock()
 }
 
 // resolvePendingWill handles a new CONNECT for the same ClientID. Resuming the
@@ -130,7 +128,9 @@ func (s *Server) resolvePendingWill(clientID string, cleanStart bool) {
 	pending := s.wills[clientID]
 	if pending != nil {
 		delete(s.wills, clientID)
-		pending.timer.Stop()
+		if pending.timer != nil {
+			pending.timer.Stop()
+		}
 	}
 	s.willsMu.Unlock()
 	if pending != nil && cleanStart {
@@ -138,6 +138,3 @@ func (s *Server) resolvePendingWill(clientID string, cleanStart bool) {
 	}
 }
 
-// Will state is intentionally in-memory. SessionStore persists subscriptions
-// and queued delivery state; broker process restart semantics remain separate.
-var _ sync.Locker
