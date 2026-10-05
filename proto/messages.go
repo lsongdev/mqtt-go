@@ -835,8 +835,8 @@ func (msg *Auth) Encode(w io.Writer) error {
 	if msg.Header.protocolVersion() != Version5 {
 		return errors.New("mqtt: AUTH requires MQTT 5")
 	}
-	if msg.ReasonCode == 0 && len(msg.Properties) == 0 {
-		return msg.Header.Encode(w, MsgAuth, 0)
+	if err := validateProperties(propertiesAuth, msg.Properties); err != nil {
+		return err
 	}
 	buf := new(bytes.Buffer)
 	setUint8(uint8(msg.ReasonCode), buf)
@@ -853,7 +853,7 @@ func (msg *Auth) Decode(r io.Reader, hdr Header, packetRemaining int32, config D
 		return errors.New("mqtt: AUTH requires MQTT 5")
 	}
 	if packetRemaining == 0 {
-		return nil
+		return errors.New("mqtt: AUTH requires authentication method")
 	}
 	defer func() { err = recoverError(err, recover()) }()
 	msg.ReasonCode = ReasonCode(getUint8(r, &packetRemaining))
