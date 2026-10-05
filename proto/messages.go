@@ -178,6 +178,27 @@ func (msg *Connect) Encode(w io.Writer) (err error) {
 	if !msg.WillQos.IsValid() {
 		return badWillQosError
 	}
+	if err := validateUTF8String(msg.ClientId); err != nil {
+		return err
+	}
+	if msg.UsernameFlag {
+		if err := validateUTF8String(msg.Username); err != nil {
+			return err
+		}
+	}
+	if msg.PasswordFlag {
+		if err := validateLengthPrefixed(len(msg.Password)); err != nil {
+			return err
+		}
+	}
+	if msg.WillFlag {
+		if err := validateTopicName(msg.WillTopic, false); err != nil {
+			return err
+		}
+		if err := validateLengthPrefixed(len(msg.WillMessage)); err != nil {
+			return err
+		}
+	}
 	if err := validateProtocolVersion(msg); err != nil {
 		return err
 	}
@@ -208,13 +229,13 @@ func (msg *Connect) Encode(w io.Writer) (err error) {
 			}
 		}
 		setString(msg.WillTopic, buf)
-		setString(msg.WillMessage, buf)
+		setBinary([]byte(msg.WillMessage), buf)
 	}
 	if msg.UsernameFlag {
 		setString(msg.Username, buf)
 	}
 	if msg.PasswordFlag {
-		setString(msg.Password, buf)
+		setBinary([]byte(msg.Password), buf)
 	}
 
 	return writeMessage(w, MsgConnect, &msg.Header, buf, 0)
@@ -254,13 +275,13 @@ func (msg *Connect) Decode(r io.Reader, hdr Header, packetRemaining int32, confi
 			msg.WillProperties = decodeProperties(r, &packetRemaining, propertiesWill)
 		}
 		msg.WillTopic = getString(r, &packetRemaining)
-		msg.WillMessage = getString(r, &packetRemaining)
+		msg.WillMessage = string(getBinary(r, &packetRemaining))
 	}
 	if msg.UsernameFlag {
 		msg.Username = getString(r, &packetRemaining)
 	}
 	if msg.PasswordFlag {
-		msg.Password = getString(r, &packetRemaining)
+		msg.Password = string(getBinary(r, &packetRemaining))
 	}
 
 	if packetRemaining != 0 {
@@ -343,6 +364,10 @@ func (msg *Publish) Encode(w io.Writer) (err error) {
 	if msg.Header.QosLevel.HasId() && msg.MessageId == 0 {
 		return badPacketIdentifierError
 	}
+	allowEmptyTopic := msg.Header.protocolVersion() == Version5 && hasProperty(msg.Properties, PropertyTopicAlias)
+	if err := validateTopicName(msg.TopicName, allowEmptyTopic); err != nil {
+		return err
+	}
 	buf := new(bytes.Buffer)
 	payload := msg.Payload
 	if payload == nil {
@@ -383,6 +408,10 @@ func (msg *Publish) Decode(r io.Reader, hdr Header, packetRemaining int32, confi
 	}
 	if msg.Header.protocolVersion() == Version5 {
 		msg.Properties = decodeProperties(r, &packetRemaining, propertiesPublish)
+	}
+	allowEmptyTopic := msg.Header.protocolVersion() == Version5 && hasProperty(msg.Properties, PropertyTopicAlias)
+	if err := validateTopicName(msg.TopicName, allowEmptyTopic); err != nil {
+		return err
 	}
 
 	payloadReader := &io.LimitedReader{R: r, N: int64(packetRemaining)}
@@ -495,6 +524,9 @@ func (msg *Subscribe) Encode(w io.Writer) (err error) {
 		}
 	}
 	for _, topicSub := range msg.Topics {
+		if err := validateTopicFilter(topicSub.Topic); err != nil {
+			return err
+		}
 		if !topicSub.Qos.IsValid() || topicSub.RetainHandling > 2 {
 			return errors.New("mqtt: invalid subscription options")
 		}
@@ -528,6 +560,9 @@ func (msg *Subscribe) Decode(r io.Reader, hdr Header, packetRemaining int32, con
 	var topics []TopicQos
 	for packetRemaining > 0 {
 		topic := getString(r, &packetRemaining)
+		if err := validateTopicFilter(topic); err != nil {
+			return err
+		}
 		options := getUint8(r, &packetRemaining)
 		if options&0xc0 != 0 || QosLevel(options&3) == qosFirstInvalid || (msg.Header.protocolVersion() == Version5 && (options>>4)&3 == 3) || (msg.Header.protocolVersion() != Version5 && options&0xfc != 0) {
 			return errors.New("mqtt: invalid subscription options")
@@ -628,6 +663,9 @@ func (msg *Unsubscribe) Encode(w io.Writer) (err error) {
 		}
 	}
 	for _, topic := range msg.Topics {
+		if err := validateTopicFilter(topic); err != nil {
+			return err
+		}
 		setString(topic, buf)
 	}
 
@@ -653,7 +691,11 @@ func (msg *Unsubscribe) Decode(r io.Reader, hdr Header, packetRemaining int32, c
 	}
 	topics := make([]string, 0)
 	for packetRemaining > 0 {
-		topics = append(topics, getString(r, &packetRemaining))
+		topic := getString(r, &packetRemaining)
+		if err := validateTopicFilter(topic); err != nil {
+			return err
+		}
+		topics = append(topics, topic)
 	}
 	if len(topics) == 0 {
 		return errors.New("mqtt: UNSUBSCRIBE requires at least one topic filter")
