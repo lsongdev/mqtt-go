@@ -102,6 +102,10 @@ func (s *Server) scheduleWill(c *incomingConn) {
 	}
 
 	pending := &pendingWill{message: message}
+	s.willsMu.Lock()
+	if previous := s.wills[c.clientid]; previous != nil {
+		previous.timer.Stop()
+	}
 	pending.timer = time.AfterFunc(delay, func() {
 		s.willsMu.Lock()
 		if s.wills[c.clientid] != pending {
@@ -112,10 +116,6 @@ func (s *Server) scheduleWill(c *incomingConn) {
 		s.willsMu.Unlock()
 		s.subs.submit(nil, message)
 	})
-	s.willsMu.Lock()
-	if previous := s.wills[c.clientid]; previous != nil {
-		previous.timer.Stop()
-	}
 	s.wills[c.clientid] = pending
 	s.willsMu.Unlock()
 }
