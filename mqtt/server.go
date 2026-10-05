@@ -124,13 +124,6 @@ func (s *Server) newIncomingConn(conn net.Conn) *incomingConn {
 	}
 }
 
-// Start makes the Server start accepting and handling connections.
-func (s *Server) Start() {
-	go func() {
-
-	}()
-}
-
 func ListenAndServe(addr string, server *Server) (err error) {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -174,6 +167,7 @@ func (s *Server) Close() error {
 		for _, conn := range connections {
 			_ = conn.Close()
 		}
+		s.subs.close()
 	})
 	return nil
 }
@@ -627,6 +621,8 @@ type post struct {
 type subscriptions struct {
 	mu         sync.Mutex // guards access to fields below
 	posts      chan post
+	done       chan struct{}
+	closeOnce  sync.Once
 	retain     map[string]retain
 	subs       map[string][]subscription // topic <-> conns
 	wildcards  []wild
@@ -659,6 +655,7 @@ func newSubscriptions() *subscriptions {
 		subs:       make(map[string][]subscription),
 		retain:     make(map[string]retain),
 		posts:      make(chan post, postQueue),
+		done:       make(chan struct{}),
 		roundRobin: make(map[string]uint64),
 	}
 	// One dispatcher preserves ordered-topic delivery. Socket writes remain
@@ -908,7 +905,13 @@ func (s *subscriptions) unsub(topic string, c *incomingConn) {
 
 // run is the ordered subscription dispatcher.
 func (s *subscriptions) run() {
-	for post := range s.posts {
+	for {
+		var post post
+		select {
+		case post = <-s.posts:
+		case <-s.done:
+			return
+		}
 		// Remember the original retain setting, but send out immediate
 		// copies without retain: "When a server sends a PUBLISH to a client
 		// as a result of a subscription that already existed when the
@@ -975,8 +978,17 @@ func (s *subscriptions) run() {
 	}
 }
 
-func (s *subscriptions) submit(c *incomingConn, m *proto.Publish) {
-	s.posts <- post{c: c, m: m}
+func (s *subscriptions) submit(c *incomingConn, m *proto.Publish) bool {
+	select {
+	case s.posts <- post{c: c, m: m}:
+		return true
+	case <-s.done:
+		return false
+	}
+}
+
+func (s *subscriptions) close() {
+	s.closeOnce.Do(func() { close(s.done) })
 }
 
 func isWildcard(topic string) bool {
