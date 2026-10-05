@@ -70,6 +70,27 @@ For a custom transport (TLS, an in-memory pipe, or another `net.Conn`), use
 `NewClient` and `Connect(user, pass)` APIs remain available and default to
 MQTT 3.1.1.
 
+For a long-running TCP client, `DialWithReconnect` adds redial with bounded
+exponential backoff while keeping a stable `Incoming` channel. Successful
+subscriptions are replayed only when the broker reports that no previous
+Session is present.
+
+```go
+client, err := mqtt.DialWithReconnect(ctx, address, mqtt.ClientOptions{
+    ProtocolVersion: proto.Version5,
+    ClientID:        "worker-1",
+    CleanStart:      false,
+    SessionExpiry:   time.Hour,
+}, mqtt.ReconnectOptions{
+    MinDelay: 250 * time.Millisecond,
+    MaxDelay: 30 * time.Second,
+})
+```
+
+Application publishes are not silently queued while disconnected:
+`Publish` returns `mqtt.ErrClientClosed`, leaving retry/idempotency policy to
+the application.
+
 ## Embedded broker
 
 The broker accepts a caller-owned listener, so lifecycle, TLS, and port
@@ -108,6 +129,12 @@ broker, err := mqtt.NewServerWithOptions(mqtt.ServerOptions{
     EnableSharedSubscriptions: true,
     SessionStore:              store,
     MaxPacketSize:             8 << 20,
+    Authenticator: mqtt.AuthenticateFunc(func(ctx context.Context, req mqtt.AuthRequest) error {
+        if req.Username != "device" || string(req.Password) != "secret" {
+            return mqtt.ErrBadCredentials
+        }
+        return nil
+    }),
 })
 if err != nil {
     log.Fatal(err)
@@ -120,6 +147,21 @@ in-memory sessions. Client and broker runtimes reject packets larger than
 `mqtt.DefaultMaxPacketSize` (16 MiB) by default, before payload allocation.
 Set `MaxPacketSize` explicitly when the application requires a different bound.
 
+Client Last Will is configured directly in `ClientOptions`. MQTT 5 Will
+properties, including Will Delay, are preserved when the Will becomes a
+PUBLISH message.
+
+```go
+Will: &mqtt.Will{
+    Topic:   "devices/worker-1/status",
+    Payload: []byte("offline"),
+    QoS:     proto.QosAtLeastOnce,
+    Retain:  true,
+    Properties: proto.Properties{}.
+        Add(proto.PropertyWillDelayInterval, uint32(10)),
+},
+```
+
 ## Protocol support
 
 | Capability | MQTT 3.1.1 (v4) | MQTT 5.0 (v5) |
@@ -130,7 +172,9 @@ Set `MaxPacketSize` explicitly when the application requires a different bound.
 | Retained messages and `+` / `#` filters | in memory | in memory |
 | PING / DISCONNECT | yes | yes, including reason code/properties |
 | PUBACK/PUBREC/PUBREL/PUBCOMP codec | yes | yes |
-| AUTH codec | n/a | yes |
+| CONNECT authentication callback | yes | yes |
+| AUTH packet codec | n/a | yes |
+| Last Will | yes | yes, including Will Delay |
 | Broker/client QoS 2 flow | optional, four-step handshake | optional, four-step handshake |
 | Persistent sessions / offline queue | optional, memory or SQLite | optional, expiry and SQLite recovery |
 | Shared subscriptions | optional `$share/{group}/{filter}` | optional `$share/{group}/{filter}` |
@@ -173,9 +217,17 @@ message := &proto.Publish{
   returns reason code `0x9e` and the broker advertises the feature as unavailable.
 
 For persistent broker-to-client QoS 2 delivery, the Packet ID and PUBLISH or
-PUBREL stage are durable and resume after reconnect. The client intentionally
-does not implement an automatic reconnect policy; applications decide when and
-how to reconnect.
+PUBREL stage are durable and resume after reconnect.
+
+- `Authenticator` runs before a CONNECT can take over a ClientID or attach to
+  a Session. `ErrBadCredentials` and `ErrNotAuthorized` map to the
+  corresponding MQTT 3.1.1 and MQTT 5 CONNACK reason codes.
+- Last Will is discarded only by a normal DISCONNECT. MQTT 5 delayed Will is
+  published when the Will Delay expires or the Session ends, whichever happens
+  first, and is cancelled when the same Session is resumed in time.
+- `DialWithReconnect` is deliberately layered above `ClientConn`: raw
+  custom transports remain one-connection primitives, while the managed TCP
+  client owns redial and subscription replay.
 
 ## Architecture
 
@@ -202,17 +254,20 @@ CI enforces formatting, vet, unit/integration tests, and the race detector.
 The suite covers exact v4/v5 wire encodings, malformed and truncated packets,
 MQTT 5 property contexts and value constraints, topic/filter syntax, packet
 identifier wraparound, packet-size limits, retained-message semantics,
-Keep Alive, optional QoS 2, shared subscriptions, session resume, SQLite
-restart recovery, expiry, and offline queue acknowledgement. The protocol
-decoder also has a fuzz target that asserts arbitrary input does not panic.
+Keep Alive, CONNECT authentication, Last Will and Will Delay, automatic
+reconnect/subscription replay, optional QoS 2, shared subscriptions, session
+resume, SQLite restart recovery, expiry, and offline queue acknowledgement.
+The protocol decoder also has a fuzz target that asserts arbitrary input does
+not panic.
 
 ## Scope
 
-The broker currently focuses on messaging, QoS, retained messages, sessions,
-and shared subscriptions. It does not yet implement broker-side authentication
-or Last Will delivery, and the client does not automatically reconnect. Keeping
-these boundaries explicit avoids presenting partial semantics as full protocol
-support.
+The broker now includes CONNECT authentication and Last Will delivery, and the
+managed TCP client supports automatic reconnect. MQTT 5 enhanced
+challenge/response authentication (AUTH exchange), per-topic authorization,
+and persistence of pending delayed Wills across a broker process restart are
+not implemented. These boundaries remain explicit rather than presenting
+partial semantics as complete support.
 
 ## License
 
