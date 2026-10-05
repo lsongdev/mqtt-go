@@ -283,6 +283,12 @@ type ConnAck struct {
 }
 
 func (msg *ConnAck) Encode(w io.Writer) (err error) {
+	if msg.Header.protocolVersion() != Version5 && !msg.ReturnCode.IsValid() {
+		return badReturnCodeError
+	}
+	if msg.SessionPresent && msg.ReturnCode != RetCodeAccepted {
+		return errors.New("mqtt: session present requires successful CONNACK")
+	}
 	buf := new(bytes.Buffer)
 
 	flags := 0x1 & boolToByte(msg.SessionPresent)
@@ -307,6 +313,9 @@ func (msg *ConnAck) Decode(r io.Reader, hdr Header, packetRemaining int32, confi
 
 	msg.SessionPresent = (getUint8(r, &packetRemaining) & 0x01) > 0
 	msg.ReturnCode = ReturnCode(getUint8(r, &packetRemaining))
+	if msg.SessionPresent && msg.ReturnCode != RetCodeAccepted {
+		return errors.New("mqtt: session present requires successful CONNACK")
+	}
 	if msg.Header.protocolVersion() != Version5 && !msg.ReturnCode.IsValid() {
 		return badReturnCodeError
 	}
@@ -331,6 +340,9 @@ type Publish struct {
 }
 
 func (msg *Publish) Encode(w io.Writer) (err error) {
+	if msg.Header.QosLevel.HasId() && msg.MessageId == 0 {
+		return badPacketIdentifierError
+	}
 	buf := new(bytes.Buffer)
 	payload := msg.Payload
 	if payload == nil {
@@ -365,6 +377,9 @@ func (msg *Publish) Decode(r io.Reader, hdr Header, packetRemaining int32, confi
 	msg.TopicName = getString(r, &packetRemaining)
 	if msg.Header.QosLevel.HasId() {
 		msg.MessageId = getUint16(r, &packetRemaining)
+		if msg.MessageId == 0 {
+			return badPacketIdentifierError
+		}
 	}
 	if msg.Header.protocolVersion() == Version5 {
 		msg.Properties = decodeProperties(r, &packetRemaining)
@@ -466,6 +481,12 @@ type TopicQos struct {
 }
 
 func (msg *Subscribe) Encode(w io.Writer) (err error) {
+	if msg.MessageId == 0 {
+		return badPacketIdentifierError
+	}
+	if len(msg.Topics) == 0 {
+		return errors.New("mqtt: SUBSCRIBE requires at least one topic filter")
+	}
 	buf := new(bytes.Buffer)
 	setUint16(msg.MessageId, buf)
 	if msg.Header.protocolVersion() == Version5 {
@@ -498,6 +519,9 @@ func (msg *Subscribe) Decode(r io.Reader, hdr Header, packetRemaining int32, con
 	msg.Header.Version = decoderVersion(config)
 
 	msg.MessageId = getUint16(r, &packetRemaining)
+	if msg.MessageId == 0 {
+		return badPacketIdentifierError
+	}
 	if msg.Header.protocolVersion() == Version5 {
 		msg.Properties = decodeProperties(r, &packetRemaining)
 	}
@@ -512,6 +536,9 @@ func (msg *Subscribe) Decode(r io.Reader, hdr Header, packetRemaining int32, con
 			Topic: topic, Qos: QosLevel(options & 3), NoLocal: options&4 != 0,
 			RetainAsPublished: options&8 != 0, RetainHandling: (options >> 4) & 3,
 		})
+	}
+	if len(topics) == 0 {
+		return errors.New("mqtt: SUBSCRIBE requires at least one topic filter")
 	}
 	msg.Topics = topics
 
@@ -528,6 +555,9 @@ type SubAck struct {
 }
 
 func (msg *SubAck) Encode(w io.Writer) (err error) {
+	if msg.MessageId == 0 {
+		return badPacketIdentifierError
+	}
 	buf := new(bytes.Buffer)
 	setUint16(msg.MessageId, buf)
 	if msg.Header.protocolVersion() == Version5 {
@@ -555,6 +585,9 @@ func (msg *SubAck) Decode(r io.Reader, hdr Header, packetRemaining int32, config
 	msg.Header.Version = decoderVersion(config)
 
 	msg.MessageId = getUint16(r, &packetRemaining)
+	if msg.MessageId == 0 {
+		return badPacketIdentifierError
+	}
 	if msg.Header.protocolVersion() == Version5 {
 		msg.Properties = decodeProperties(r, &packetRemaining)
 		for packetRemaining > 0 {
@@ -581,6 +614,12 @@ type Unsubscribe struct {
 }
 
 func (msg *Unsubscribe) Encode(w io.Writer) (err error) {
+	if msg.MessageId == 0 {
+		return badPacketIdentifierError
+	}
+	if len(msg.Topics) == 0 {
+		return errors.New("mqtt: UNSUBSCRIBE requires at least one topic filter")
+	}
 	buf := new(bytes.Buffer)
 	setUint16(msg.MessageId, buf)
 	if msg.Header.protocolVersion() == Version5 {
@@ -606,12 +645,18 @@ func (msg *Unsubscribe) Decode(r io.Reader, hdr Header, packetRemaining int32, c
 	msg.Header.Version = decoderVersion(config)
 
 	msg.MessageId = getUint16(r, &packetRemaining)
+	if msg.MessageId == 0 {
+		return badPacketIdentifierError
+	}
 	if msg.Header.protocolVersion() == Version5 {
 		msg.Properties = decodeProperties(r, &packetRemaining)
 	}
 	topics := make([]string, 0)
 	for packetRemaining > 0 {
 		topics = append(topics, getString(r, &packetRemaining))
+	}
+	if len(topics) == 0 {
+		return errors.New("mqtt: UNSUBSCRIBE requires at least one topic filter")
 	}
 	msg.Topics = topics
 
@@ -627,6 +672,9 @@ type UnsubAck struct {
 }
 
 func (msg *UnsubAck) Encode(w io.Writer) error {
+	if msg.MessageId == 0 {
+		return badPacketIdentifierError
+	}
 	buf := new(bytes.Buffer)
 	setUint16(msg.MessageId, buf)
 	if msg.Header.protocolVersion() == Version5 {
@@ -645,6 +693,9 @@ func (msg *UnsubAck) Decode(r io.Reader, hdr Header, packetRemaining int32, conf
 	defer func() { err = recoverError(err, recover()) }()
 	msg.Header.Version = decoderVersion(config)
 	msg.MessageId = getUint16(r, &packetRemaining)
+	if msg.MessageId == 0 {
+		return badPacketIdentifierError
+	}
 	if msg.Header.protocolVersion() == Version5 {
 		msg.Properties = decodeProperties(r, &packetRemaining)
 		for packetRemaining > 0 {
@@ -774,6 +825,9 @@ func (msg *Auth) Decode(r io.Reader, hdr Header, packetRemaining int32, config D
 }
 
 func encodeAckCommon(w io.Writer, hdr *Header, messageId uint16, reason ReasonCode, props Properties, msgType MessageType) error {
+	if messageId == 0 {
+		return badPacketIdentifierError
+	}
 	buf := new(bytes.Buffer)
 	setUint16(messageId, buf)
 	if hdr.protocolVersion() == Version5 && (reason != 0 || len(props) != 0) {
@@ -791,6 +845,9 @@ func decodeAckCommon(r io.Reader, hdr Header, packetRemaining int32, messageId *
 	}()
 
 	*messageId = getUint16(r, &packetRemaining)
+	if *messageId == 0 {
+		return badPacketIdentifierError
+	}
 	if decoderVersion(config) == Version5 && packetRemaining > 0 {
 		*reason = ReasonCode(getUint8(r, &packetRemaining))
 		if packetRemaining > 0 {
