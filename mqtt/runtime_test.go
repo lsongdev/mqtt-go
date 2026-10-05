@@ -161,7 +161,6 @@ func TestServerKeepAliveClosesIdleConnection(t *testing.T) {
 	}
 }
 
-
 func TestBrokerPacketIdentifierWrapSkipsZero(t *testing.T) {
 	c := &incomingConn{
 		nextID:    65535,
