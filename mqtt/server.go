@@ -669,6 +669,9 @@ func (s *subscriptions) sendRetain(tq proto.TopicQos, c *incomingConn) {
 	_, filter, _ := parseSharedFilter(tq.Topic)
 	w := newWild(filter, nil)
 	for name, retained := range s.retain {
+		if strings.HasPrefix(name, "$") && !strings.HasPrefix(filter, "$") {
+			continue
+		}
 		if (!isWildcard(filter) && name == filter) || (isWildcard(filter) && w.matches(strings.Split(name, "/"))) {
 			m := retained.m
 			if m.QosLevel > tq.Qos {
