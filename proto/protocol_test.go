@@ -131,6 +131,13 @@ func TestTruncatedPacketReturnsError(t *testing.T) {
 	}
 }
 
+func TestRejectsNonCanonicalVariableByteInteger(t *testing.T) {
+	// Remaining Length 0 encoded using two bytes is malformed.
+	if _, err := DecodeOneMessage(bytes.NewReader([]byte{0xC0, 0x80, 0x00}), nil); err == nil {
+		t.Fatal("accepted overlong Remaining Length")
+	}
+}
+
 func TestRejectsMalformedFixedHeader(t *testing.T) {
 	// SUBSCRIBE must have flags 0b0010.
 	if _, err := DecodeOneMessage(bytes.NewReader([]byte{0x80, 0}), nil); err == nil {
