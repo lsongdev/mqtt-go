@@ -14,8 +14,8 @@ var ConnectionErrors = [6]error{
 	errors.New("connection refused: unacceptable protocol version"),
 	errors.New("connection refused: identifier rejected"),
 	errors.New("connection refused: server unavailable"),
-	errors.New("connection refused: bad user name or password"),
-	errors.New("connection refused: not authorized"),
+	ErrBadCredentials,
+	ErrNotAuthorized,
 }
 
 // ErrClientClosed is returned when an operation cannot complete because the
