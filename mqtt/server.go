@@ -97,14 +97,20 @@ func NewServerWithOptions(options ServerOptions) (*Server, error) {
 
 func (svr *Server) report() {
 	for {
-		svr.stats.publish(svr.subs, svr.StatsInterval)
+		interval := svr.StatsInterval
+		if interval <= 0 {
+			interval = time.Second
+		}
+		svr.stats.publish(svr.subs, interval)
+		timer := time.NewTimer(interval)
 		select {
 		case <-svr.Done:
+			if !timer.Stop() {
+				<-timer.C
+			}
 			return
-		default:
-			// keep going
+		case <-timer.C:
 		}
-		time.Sleep(svr.StatsInterval)
 	}
 }
 
@@ -152,15 +158,16 @@ func (s *Server) Serve(listener net.Listener) error {
 
 // ServeConn hands an already-established transport to the broker.
 func (s *Server) ServeConn(conn net.Conn) {
+	cli := s.newIncomingConn(conn)
+	s.clientsMu.Lock()
 	select {
 	case <-s.Done:
+		s.clientsMu.Unlock()
 		_ = conn.Close()
 		return
 	default:
+		s.connections[cli] = struct{}{}
 	}
-	cli := s.newIncomingConn(conn)
-	s.clientsMu.Lock()
-	s.connections[cli] = struct{}{}
 	s.clientsMu.Unlock()
 	s.stats.clientConnect()
 	cli.start()
@@ -1183,7 +1190,11 @@ func (s *stats) publish(sub *subscriptions, interval time.Duration) {
 		atomic.LoadInt64(&s.sent)))
 
 	msgs := atomic.LoadInt64(&s.recv) + atomic.LoadInt64(&s.sent)
-	msgpersec := (msgs - s.lastmsgs) / int64(interval/time.Second)
+	seconds := int64(interval / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	msgpersec := (msgs - s.lastmsgs) / seconds
 	// no need for atomic because we are the only reader/writer of it
 	s.lastmsgs = msgs
 
