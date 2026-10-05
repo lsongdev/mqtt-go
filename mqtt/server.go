@@ -426,13 +426,14 @@ func (c *incomingConn) reader() {
 					connack.Properties = connack.Properties.Add(proto.PropertyAssignedClientIdentifier, c.clientid)
 				}
 			}
-			c.submit(connack)
-
-			// close connection if it was a bad connect
+			// A rejected CONNECT must send CONNACK before the transport closes.
 			if rc != proto.RetCodeAccepted {
+				r := c.submitSync(connack)
+				_ = r.wait()
 				log.Printf("Connection refused for %v: %v", c.conn.RemoteAddr(), ConnectionErrors[rc])
 				return
 			}
+			c.submit(connack)
 			c.connected = true
 			c.deliverSessionQueue()
 
