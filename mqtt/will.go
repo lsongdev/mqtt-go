@@ -137,4 +137,3 @@ func (s *Server) resolvePendingWill(clientID string, cleanStart bool) {
 		s.subs.submit(nil, pending.message)
 	}
 }
-
