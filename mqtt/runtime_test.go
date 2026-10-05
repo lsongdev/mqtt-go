@@ -1,6 +1,9 @@
 package mqtt
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -268,5 +271,182 @@ func TestServeConnAfterServerCloseClosesTransport(t *testing.T) {
 		t.Fatal("ServeConn accepted a transport after Server.Close")
 	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
 		t.Fatalf("transport was left open after Server.Close: %v", err)
+	}
+}
+
+func TestBrokerAuthentication(t *testing.T) {
+	for _, version := range []proto.ProtocolVersion{proto.Version311, proto.Version5} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			server, err := NewServerWithOptions(ServerOptions{
+				Authenticator: AuthenticateFunc(func(ctx context.Context, req AuthRequest) error {
+					if req.ClientID != "auth-client" || !req.UsernamePresent || req.Username != "user" {
+						return ErrNotAuthorized
+					}
+					if !req.PasswordPresent || string(req.Password) != "secret" {
+						return ErrBadCredentials
+					}
+					return nil
+				}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer server.Close()
+
+			ok := pipeClient(t, server, ClientOptions{
+				ProtocolVersion: version,
+				ClientID:        "auth-client",
+				CleanStart:      true,
+				Username:        "user",
+				Password:        "secret",
+			})
+			if ok == nil {
+				t.Fatal("authenticated client missing")
+			}
+
+			serverSide, clientSide := net.Pipe()
+			server.ServeConn(serverSide)
+			bad := NewClientConn(clientSide)
+			defer bad.Close()
+			err = bad.ConnectWithOptions(ClientOptions{
+				ProtocolVersion: version,
+				ClientID:        "auth-client-2",
+				CleanStart:      true,
+				Username:        "user",
+				Password:        "wrong",
+			})
+			if !errors.Is(err, ErrNotAuthorized) && !errors.Is(err, ErrBadCredentials) {
+				t.Fatalf("unexpected auth error: %v", err)
+			}
+		})
+	}
+}
+
+func TestLastWillPublishedOnUnexpectedDisconnect(t *testing.T) {
+	server := NewServer()
+	defer server.Close()
+
+	sub := pipeClient(t, server, ClientOptions{ClientID: "will-sub", CleanStart: true})
+	if ack := sub.Subscribe([]proto.TopicQos{{Topic: "will/#"}}); ack == nil {
+		t.Fatal("subscribe failed")
+	}
+	pub := pipeClient(t, server, ClientOptions{
+		ClientID:   "will-pub",
+		CleanStart: true,
+		Will: &Will{
+			Topic:   "will/device",
+			Payload: []byte("offline"),
+			QoS:     proto.QosAtLeastOnce,
+		},
+	})
+	if err := pub.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got := receivePublish(t, sub)
+	if got.TopicName != "will/device" || string(got.Payload.(proto.BytesPayload)) != "offline" {
+		t.Fatalf("will: %#v", got)
+	}
+}
+
+func TestNormalDisconnectSuppressesLastWill(t *testing.T) {
+	server := NewServer()
+	defer server.Close()
+
+	sub := pipeClient(t, server, ClientOptions{ClientID: "will-sub", CleanStart: true})
+	sub.Subscribe([]proto.TopicQos{{Topic: "will/#"}})
+	pub := pipeClient(t, server, ClientOptions{
+		ClientID:   "will-pub",
+		CleanStart: true,
+		Will:       &Will{Topic: "will/device", Payload: []byte("offline")},
+	})
+	pub.Disconnect()
+	select {
+	case got := <-sub.Incoming:
+		t.Fatalf("normal DISCONNECT published will: %#v", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestDelayedWillCancelledBySessionResume(t *testing.T) {
+	server, err := NewServerWithOptions(ServerOptions{EnablePersistentSessions: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	sub := pipeClient(t, server, ClientOptions{ProtocolVersion: proto.Version5, ClientID: "will-sub", CleanStart: true})
+	sub.Subscribe([]proto.TopicQos{{Topic: "will/#"}})
+	first := pipeClient(t, server, ClientOptions{
+		ProtocolVersion: proto.Version5,
+		ClientID:        "will-pub",
+		CleanStart:      false,
+		SessionExpiry:   5 * time.Second,
+		Will: &Will{
+			Topic:   "will/device",
+			Payload: []byte("offline"),
+			Properties: proto.Properties{}.
+				Add(proto.PropertyWillDelayInterval, uint32(1)),
+		},
+	})
+	_ = first.Close()
+
+	waitUntil(t, func() bool {
+		server.willsMu.Lock()
+		defer server.willsMu.Unlock()
+		return server.wills["will-pub"] != nil
+	})
+	resumed := pipeClient(t, server, ClientOptions{
+		ProtocolVersion: proto.Version5,
+		ClientID:        "will-pub",
+		CleanStart:      false,
+		SessionExpiry:   5 * time.Second,
+	})
+	if !resumed.SessionPresent {
+		t.Fatal("session was not resumed")
+	}
+	select {
+	case got := <-sub.Incoming:
+		t.Fatalf("resumed session published delayed will: %#v", got)
+	case <-time.After(1200 * time.Millisecond):
+	}
+}
+
+func TestCleanStartPublishesPendingWillImmediately(t *testing.T) {
+	server, err := NewServerWithOptions(ServerOptions{EnablePersistentSessions: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	sub := pipeClient(t, server, ClientOptions{ProtocolVersion: proto.Version5, ClientID: "will-sub", CleanStart: true})
+	sub.Subscribe([]proto.TopicQos{{Topic: "will/#"}})
+	first := pipeClient(t, server, ClientOptions{
+		ProtocolVersion: proto.Version5,
+		ClientID:        "will-pub",
+		CleanStart:      false,
+		SessionExpiry:   10 * time.Second,
+		Will: &Will{
+			Topic:   "will/device",
+			Payload: []byte("offline"),
+			Properties: proto.Properties{}.
+				Add(proto.PropertyWillDelayInterval, uint32(5)),
+		},
+	})
+	_ = first.Close()
+	waitUntil(t, func() bool {
+		server.willsMu.Lock()
+		defer server.willsMu.Unlock()
+		return server.wills["will-pub"] != nil
+	})
+
+	replacement := pipeClient(t, server, ClientOptions{
+		ProtocolVersion: proto.Version5,
+		ClientID:        "will-pub",
+		CleanStart:      true,
+	})
+	_ = replacement
+	got := receivePublish(t, sub)
+	if string(got.Payload.(proto.BytesPayload)) != "offline" {
+		t.Fatalf("will payload: %q", got.Payload)
 	}
 }
