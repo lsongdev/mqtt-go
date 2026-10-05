@@ -69,6 +69,7 @@ type ClientOptions struct {
 	Properties      proto.Properties
 	EnableQoS2      bool
 	SessionExpiry   time.Duration
+	MaxPacketSize   int
 }
 
 func (o ClientOptions) normalized() ClientOptions {
@@ -279,6 +280,7 @@ func (c *ClientConn) ConnectWithOptions(options ClientOptions) error {
 	c.ProtocolVersion = options.ProtocolVersion
 	c.EnableQoS2 = options.EnableQoS2
 	c.decode.Version = options.ProtocolVersion
+	c.decode.MaxPacketSize = options.MaxPacketSize
 	req := &proto.Connect{
 		ProtocolName:    proto.PROTOCOL_3_1_1,
 		ProtocolVersion: uint8(options.ProtocolVersion),
