@@ -160,3 +160,22 @@ func TestServerKeepAliveClosesIdleConnection(t *testing.T) {
 		t.Logf("idle connection closed with %v", err)
 	}
 }
+
+
+func TestBrokerPacketIdentifierWrapSkipsZero(t *testing.T) {
+	c := &incomingConn{
+		nextID:    65535,
+		packetIDs: make(map[uint16]struct{}),
+		closed:    make(chan struct{}),
+	}
+	id := c.nextMessageID()
+	if id != 65535 {
+		t.Fatalf("first id = %d", id)
+	}
+	c.releaseMessageID(id)
+	c.packetIDs[1] = struct{}{}
+	id = c.nextMessageID()
+	if id != 2 {
+		t.Fatalf("wrapped id = %d", id)
+	}
+}
