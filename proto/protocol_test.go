@@ -210,3 +210,75 @@ func FuzzDecodeOneMessage(f *testing.F) {
 		_, _ = DecodeOneMessage(bytes.NewReader(data), &DecodeOptions{MaxPacketSize: 1 << 20})
 	})
 }
+
+
+func TestMQTT5PropertyContextAndValueValidation(t *testing.T) {
+	if err := (&Auth{
+		Header:     Header{Version: Version5},
+		Properties: Properties{}.Add(PropertySessionExpiryInterval, uint32(1)),
+	}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("AUTH accepted CONNECT-only property")
+	}
+	if err := (&ConnAck{
+		Header: Header{Version: Version5},
+		Properties: Properties{}.
+			Add(PropertyMaximumQoS, byte(1)).
+			Add(PropertyMaximumQoS, byte(1)),
+	}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("CONNACK accepted duplicate Maximum QoS")
+	}
+	if err := (&Connect{
+		ProtocolName: PROTOCOL_5_0, ProtocolVersion: 5, CleanSession: true,
+		ClientId: "client", Properties: Properties{}.Add(PropertyReceiveMaximum, uint16(0)),
+	}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("CONNECT accepted Receive Maximum 0")
+	}
+	if err := (&Publish{
+		Header: Header{Version: Version5}, TopicName: "a",
+		Properties: Properties{}.Add(PropertyTopicAlias, uint16(0)),
+	}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("PUBLISH accepted Topic Alias 0")
+	}
+}
+
+func TestConnectBinaryPasswordAndWillPayloadRoundTrip(t *testing.T) {
+	password := string([]byte{0xff, 0x00, 0xfe})
+	will := string([]byte{0x00, 0xff, 0x01})
+	original := &Connect{
+		ProtocolName: PROTOCOL_3_1_1, ProtocolVersion: 4,
+		CleanSession: true, ClientId: "binary",
+		UsernameFlag: true, Username: "user",
+		PasswordFlag: true, Password: password,
+		WillFlag: true, WillTopic: "will/topic", WillMessage: will,
+	}
+	decoded, err := DecodeOneMessage(bytes.NewReader(encodePacket(t, original)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decoded.(*Connect)
+	if got.Password != password || got.WillMessage != will {
+		t.Fatalf("binary fields changed: password=%x will=%x", []byte(got.Password), []byte(got.WillMessage))
+	}
+}
+
+func TestTopicValidation(t *testing.T) {
+	if err := (&Publish{TopicName: "bad/+", Payload: BytesPayload("x")}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("accepted wildcard in topic name")
+	}
+	if err := (&Subscribe{MessageId: 1, Topics: []TopicQos{{Topic: "a/#/b"}}}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("accepted malformed topic filter")
+	}
+	if err := (&Publish{
+		Header: Header{Version: Version5}, TopicName: "",
+		Properties: Properties{}.Add(PropertyTopicAlias, uint16(1)),
+		Payload: BytesPayload("x"),
+	}).Encode(new(bytes.Buffer)); err != nil {
+		t.Fatalf("rejected MQTT 5 topic alias publish: %v", err)
+	}
+	if err := (&Publish{Header: Header{Version: Version5}, TopicName: "", Payload: BytesPayload("x")}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("accepted empty topic without alias")
+	}
+	if err := (&Publish{TopicName: string([]byte{0xff}), Payload: BytesPayload("x")}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("accepted invalid UTF-8 topic")
+	}
+}
