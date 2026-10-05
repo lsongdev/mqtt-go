@@ -196,14 +196,14 @@ func (msg *Connect) Encode(w io.Writer) (err error) {
 	buf.WriteByte(flags)
 	setUint16(msg.KeepAliveTimer, buf)
 	if ProtocolVersion(msg.ProtocolVersion) == Version5 {
-		if err := encodeProperties(buf, msg.Properties); err != nil {
+		if err := encodeProperties(buf, msg.Properties, propertiesConnect); err != nil {
 			return err
 		}
 	}
 	setString(msg.ClientId, buf)
 	if msg.WillFlag {
 		if ProtocolVersion(msg.ProtocolVersion) == Version5 {
-			if err := encodeProperties(buf, msg.WillProperties); err != nil {
+			if err := encodeProperties(buf, msg.WillProperties, propertiesWill); err != nil {
 				return err
 			}
 		}
@@ -245,13 +245,13 @@ func (msg *Connect) Decode(r io.Reader, hdr Header, packetRemaining int32, confi
 		KeepAliveTimer:  keepAliveTimer,
 	}
 	if ProtocolVersion(protocolVersion) == Version5 {
-		msg.Properties = decodeProperties(r, &packetRemaining)
+		msg.Properties = decodeProperties(r, &packetRemaining, propertiesConnect)
 	}
 	msg.ClientId = getString(r, &packetRemaining)
 
 	if msg.WillFlag {
 		if ProtocolVersion(protocolVersion) == Version5 {
-			msg.WillProperties = decodeProperties(r, &packetRemaining)
+			msg.WillProperties = decodeProperties(r, &packetRemaining, propertiesWill)
 		}
 		msg.WillTopic = getString(r, &packetRemaining)
 		msg.WillMessage = getString(r, &packetRemaining)
@@ -295,7 +295,7 @@ func (msg *ConnAck) Encode(w io.Writer) (err error) {
 	buf.WriteByte(flags)
 	setUint8(uint8(msg.ReturnCode), buf)
 	if msg.Header.protocolVersion() == Version5 {
-		if err := encodeProperties(buf, msg.Properties); err != nil {
+		if err := encodeProperties(buf, msg.Properties, propertiesConnAck); err != nil {
 			return err
 		}
 	}
@@ -320,7 +320,7 @@ func (msg *ConnAck) Decode(r io.Reader, hdr Header, packetRemaining int32, confi
 		return badReturnCodeError
 	}
 	if msg.Header.protocolVersion() == Version5 {
-		msg.Properties = decodeProperties(r, &packetRemaining)
+		msg.Properties = decodeProperties(r, &packetRemaining, propertiesConnAck)
 	}
 
 	if packetRemaining != 0 {
@@ -354,7 +354,7 @@ func (msg *Publish) Encode(w io.Writer) (err error) {
 		setUint16(msg.MessageId, buf)
 	}
 	if msg.Header.protocolVersion() == Version5 {
-		if err = encodeProperties(buf, msg.Properties); err != nil {
+		if err = encodeProperties(buf, msg.Properties, propertiesPublish); err != nil {
 			return err
 		}
 	}
@@ -382,7 +382,7 @@ func (msg *Publish) Decode(r io.Reader, hdr Header, packetRemaining int32, confi
 		}
 	}
 	if msg.Header.protocolVersion() == Version5 {
-		msg.Properties = decodeProperties(r, &packetRemaining)
+		msg.Properties = decodeProperties(r, &packetRemaining, propertiesPublish)
 	}
 
 	payloadReader := &io.LimitedReader{R: r, N: int64(packetRemaining)}
@@ -490,7 +490,7 @@ func (msg *Subscribe) Encode(w io.Writer) (err error) {
 	buf := new(bytes.Buffer)
 	setUint16(msg.MessageId, buf)
 	if msg.Header.protocolVersion() == Version5 {
-		if err := encodeProperties(buf, msg.Properties); err != nil {
+		if err := encodeProperties(buf, msg.Properties, propertiesSubscribe); err != nil {
 			return err
 		}
 	}
@@ -523,7 +523,7 @@ func (msg *Subscribe) Decode(r io.Reader, hdr Header, packetRemaining int32, con
 		return badPacketIdentifierError
 	}
 	if msg.Header.protocolVersion() == Version5 {
-		msg.Properties = decodeProperties(r, &packetRemaining)
+		msg.Properties = decodeProperties(r, &packetRemaining, propertiesSubscribe)
 	}
 	var topics []TopicQos
 	for packetRemaining > 0 {
@@ -561,7 +561,7 @@ func (msg *SubAck) Encode(w io.Writer) (err error) {
 	buf := new(bytes.Buffer)
 	setUint16(msg.MessageId, buf)
 	if msg.Header.protocolVersion() == Version5 {
-		if err := encodeProperties(buf, msg.Properties); err != nil {
+		if err := encodeProperties(buf, msg.Properties, propertiesSubAck); err != nil {
 			return err
 		}
 		for _, reason := range msg.ReasonCodes {
@@ -589,7 +589,7 @@ func (msg *SubAck) Decode(r io.Reader, hdr Header, packetRemaining int32, config
 		return badPacketIdentifierError
 	}
 	if msg.Header.protocolVersion() == Version5 {
-		msg.Properties = decodeProperties(r, &packetRemaining)
+		msg.Properties = decodeProperties(r, &packetRemaining, propertiesSubAck)
 		for packetRemaining > 0 {
 			msg.ReasonCodes = append(msg.ReasonCodes, ReasonCode(getUint8(r, &packetRemaining)))
 		}
@@ -623,7 +623,7 @@ func (msg *Unsubscribe) Encode(w io.Writer) (err error) {
 	buf := new(bytes.Buffer)
 	setUint16(msg.MessageId, buf)
 	if msg.Header.protocolVersion() == Version5 {
-		if err := encodeProperties(buf, msg.Properties); err != nil {
+		if err := encodeProperties(buf, msg.Properties, propertiesUnsubscribe); err != nil {
 			return err
 		}
 	}
@@ -649,7 +649,7 @@ func (msg *Unsubscribe) Decode(r io.Reader, hdr Header, packetRemaining int32, c
 		return badPacketIdentifierError
 	}
 	if msg.Header.protocolVersion() == Version5 {
-		msg.Properties = decodeProperties(r, &packetRemaining)
+		msg.Properties = decodeProperties(r, &packetRemaining, propertiesUnsubscribe)
 	}
 	topics := make([]string, 0)
 	for packetRemaining > 0 {
@@ -678,7 +678,7 @@ func (msg *UnsubAck) Encode(w io.Writer) error {
 	buf := new(bytes.Buffer)
 	setUint16(msg.MessageId, buf)
 	if msg.Header.protocolVersion() == Version5 {
-		if err := encodeProperties(buf, msg.Properties); err != nil {
+		if err := encodeProperties(buf, msg.Properties, propertiesUnsubAck); err != nil {
 			return err
 		}
 		for _, reason := range msg.ReasonCodes {
@@ -697,7 +697,7 @@ func (msg *UnsubAck) Decode(r io.Reader, hdr Header, packetRemaining int32, conf
 		return badPacketIdentifierError
 	}
 	if msg.Header.protocolVersion() == Version5 {
-		msg.Properties = decodeProperties(r, &packetRemaining)
+		msg.Properties = decodeProperties(r, &packetRemaining, propertiesUnsubAck)
 		for packetRemaining > 0 {
 			msg.ReasonCodes = append(msg.ReasonCodes, ReasonCode(getUint8(r, &packetRemaining)))
 		}
@@ -753,7 +753,7 @@ func (msg *Disconnect) Encode(w io.Writer) error {
 	}
 	buf := new(bytes.Buffer)
 	setUint8(uint8(msg.ReasonCode), buf)
-	if err := encodeProperties(buf, msg.Properties); err != nil {
+	if err := encodeProperties(buf, msg.Properties, propertiesDisconnect); err != nil {
 		return err
 	}
 	return writeMessage(w, MsgDisconnect, &msg.Header, buf, 0)
@@ -774,7 +774,7 @@ func (msg *Disconnect) Decode(r io.Reader, hdr Header, packetRemaining int32, co
 	defer func() { err = recoverError(err, recover()) }()
 	msg.ReasonCode = ReasonCode(getUint8(r, &packetRemaining))
 	if packetRemaining > 0 {
-		msg.Properties = decodeProperties(r, &packetRemaining)
+		msg.Properties = decodeProperties(r, &packetRemaining, propertiesDisconnect)
 	}
 	if packetRemaining != 0 {
 		return msgTooLongError
@@ -798,7 +798,7 @@ func (msg *Auth) Encode(w io.Writer) error {
 	}
 	buf := new(bytes.Buffer)
 	setUint8(uint8(msg.ReasonCode), buf)
-	if err := encodeProperties(buf, msg.Properties); err != nil {
+	if err := encodeProperties(buf, msg.Properties, propertiesAuth); err != nil {
 		return err
 	}
 	return writeMessage(w, MsgAuth, &msg.Header, buf, 0)
@@ -816,7 +816,7 @@ func (msg *Auth) Decode(r io.Reader, hdr Header, packetRemaining int32, config D
 	defer func() { err = recoverError(err, recover()) }()
 	msg.ReasonCode = ReasonCode(getUint8(r, &packetRemaining))
 	if packetRemaining > 0 {
-		msg.Properties = decodeProperties(r, &packetRemaining)
+		msg.Properties = decodeProperties(r, &packetRemaining, propertiesAuth)
 	}
 	if packetRemaining != 0 {
 		return msgTooLongError
@@ -832,7 +832,7 @@ func encodeAckCommon(w io.Writer, hdr *Header, messageId uint16, reason ReasonCo
 	setUint16(messageId, buf)
 	if hdr.protocolVersion() == Version5 && (reason != 0 || len(props) != 0) {
 		setUint8(uint8(reason), buf)
-		if err := encodeProperties(buf, props); err != nil {
+		if err := encodeProperties(buf, props, propertiesAck); err != nil {
 			return err
 		}
 	}
@@ -851,7 +851,7 @@ func decodeAckCommon(r io.Reader, hdr Header, packetRemaining int32, messageId *
 	if decoderVersion(config) == Version5 && packetRemaining > 0 {
 		*reason = ReasonCode(getUint8(r, &packetRemaining))
 		if packetRemaining > 0 {
-			*props = decodeProperties(r, &packetRemaining)
+			*props = decodeProperties(r, &packetRemaining, propertiesAck)
 		}
 	}
 
