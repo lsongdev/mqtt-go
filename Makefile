@@ -1,14 +1,14 @@
 BINARY_NAME=bin/mqtt
 
 build:
-	GOARCH=arm64 GOOS=darwin go build  -ldflags="-s -w"  -o ${BINARY_NAME}-darwin-arm64
-	GOARCH=amd64 GOOS=darwin go build -ldflags="-s -w" -o ${BINARY_NAME}-darwin-amd64
-	GOARCH=amd64 GOOS=linux go build -ldflags="-s -w" -o ${BINARY_NAME}-linux-amd64
-	GOARCH=amd64 GOOS=windows go build -ldflags="-s -w" -o ${BINARY_NAME}-windows-amd64.exe
+	mkdir -p bin
+	GOARCH=arm64 GOOS=darwin go build -ldflags="-s -w" -o ${BINARY_NAME}-darwin-arm64 ./cmd/mqtt
+	GOARCH=amd64 GOOS=darwin go build -ldflags="-s -w" -o ${BINARY_NAME}-darwin-amd64 ./cmd/mqtt
+	GOARCH=amd64 GOOS=linux go build -ldflags="-s -w" -o ${BINARY_NAME}-linux-amd64 ./cmd/mqtt
+	GOARCH=amd64 GOOS=windows go build -ldflags="-s -w" -o ${BINARY_NAME}-windows-amd64.exe ./cmd/mqtt
 
 clean:
-	go clean
-	rm ${BINARY_NAME}-darwin-arm64
-	rm ${BINARY_NAME}-darwin-amd64
-	rm ${BINARY_NAME}-linux-amd64
-	rm ${BINARY_NAME}-windows-x64.exe
+	rm -f ${BINARY_NAME}-darwin-arm64
+	rm -f ${BINARY_NAME}-darwin-amd64
+	rm -f ${BINARY_NAME}-linux-amd64
+	rm -f ${BINARY_NAME}-windows-amd64.exe
