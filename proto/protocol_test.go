@@ -2,6 +2,7 @@ package proto
 
 import (
 	"bytes"
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -146,4 +147,66 @@ func TestPropertyTypeIsChecked(t *testing.T) {
 	if err := m.Encode(new(bytes.Buffer)); err == nil {
 		t.Fatal("accepted wrong property value type")
 	}
+}
+
+
+func TestRejectsZeroPacketIdentifiers(t *testing.T) {
+	cases := []Message{
+		&Publish{Header: Header{QosLevel: QosAtLeastOnce}, TopicName: "a", MessageId: 0, Payload: BytesPayload("x")},
+		&PubAck{MessageId: 0},
+		&Subscribe{MessageId: 0, Topics: []TopicQos{{Topic: "a"}}},
+		&Unsubscribe{MessageId: 0, Topics: []string{"a"}},
+	}
+	for _, packet := range cases {
+		if err := packet.Encode(new(bytes.Buffer)); err == nil {
+			t.Fatalf("encoded %T with packet identifier 0", packet)
+		}
+	}
+
+	// QoS 1 PUBLISH with Packet Identifier 0.
+	if _, err := DecodeOneMessage(bytes.NewReader([]byte{0x32, 5, 0, 1, 'a', 0, 0}), nil); err == nil {
+		t.Fatal("decoded PUBLISH with packet identifier 0")
+	}
+}
+
+func TestSubscribeAndUnsubscribeRequirePayload(t *testing.T) {
+	if err := (&Subscribe{MessageId: 1}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("encoded empty SUBSCRIBE")
+	}
+	if err := (&Unsubscribe{MessageId: 1}).Encode(new(bytes.Buffer)); err == nil {
+		t.Fatal("encoded empty UNSUBSCRIBE")
+	}
+	if _, err := DecodeOneMessage(bytes.NewReader([]byte{0x82, 2, 0, 1}), nil); err == nil {
+		t.Fatal("decoded empty SUBSCRIBE")
+	}
+	if _, err := DecodeOneMessage(bytes.NewReader([]byte{0xA2, 2, 0, 1}), nil); err == nil {
+		t.Fatal("decoded empty UNSUBSCRIBE")
+	}
+}
+
+func TestDecodePacketSizeLimitBeforeAllocation(t *testing.T) {
+	_, err := DecodeOneMessage(bytes.NewReader([]byte{0x30, 9}), &DecodeOptions{MaxPacketSize: 8})
+	if !errors.Is(err, ErrPacketTooLarge) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func FuzzDecodeOneMessage(f *testing.F) {
+	seeds := [][]byte{
+		{0xC0, 0x00},
+		{0xD0, 0x00},
+		{0x30, 0x03, 0x00, 0x01, 'a'},
+		{0x10, 0x0C, 0x00, 0x04, 'M', 'Q', 'T', 'T', 0x04, 0x02, 0x00, 0x00, 0x00, 0x00},
+	}
+	for _, seed := range seeds {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("decoder panicked for %x: %v", data, recovered)
+			}
+		}()
+		_, _ = DecodeOneMessage(bytes.NewReader(data), &DecodeOptions{MaxPacketSize: 1 << 20})
+	})
 }
