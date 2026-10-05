@@ -25,9 +25,13 @@ type Server struct {
 	clients       map[string]*incomingConn
 	connections   map[*incomingConn]struct{}
 	options       ServerOptions
+	ctx           context.Context
+	cancel        context.CancelFunc
 	sessionsMu    sync.Mutex
 	sessions      map[string]*sessionState
 	clientSeq     uint64
+	willsMu       sync.Mutex
+	wills         map[string]*pendingWill
 	closeOnce     sync.Once
 }
 
@@ -38,6 +42,7 @@ type ServerOptions struct {
 	EnablePersistentSessions  bool
 	EnableSharedSubscriptions bool
 	SessionStore              SessionStore
+	Authenticator             Authenticator
 	MaxPacketSize             int
 }
 
@@ -60,6 +65,7 @@ func NewServerWithOptions(options ServerOptions) (*Server, error) {
 	if options.MaxPacketSize == 0 {
 		options.MaxPacketSize = DefaultMaxPacketSize
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	svr := &Server{
 		Done:          make(chan struct{}),
 		subs:          newSubscriptions(),
@@ -68,7 +74,10 @@ func NewServerWithOptions(options ServerOptions) (*Server, error) {
 		connections:   make(map[*incomingConn]struct{}),
 		StatsInterval: time.Second * 10,
 		options:       options,
+		ctx:           ctx,
+		cancel:        cancel,
 		sessions:      make(map[string]*sessionState),
+		wills:         make(map[string]*pendingWill),
 	}
 	if options.SessionStore != nil {
 		stored, err := options.SessionStore.List(context.Background())
@@ -177,6 +186,7 @@ func (s *Server) ServeConn(conn net.Conn) {
 func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.Done)
+		s.cancel()
 		s.clientsMu.Lock()
 		connections := make([]net.Conn, 0, len(s.connections))
 		for client := range s.connections {
@@ -210,6 +220,10 @@ type incomingConn struct {
 	outgoingQoS2   map[uint16]*proto.Publish
 	outgoingStored map[uint16]uint64
 	qosMu          sync.Mutex
+	willMu         sync.Mutex
+	will           *proto.Publish
+	willDelay      time.Duration
+	willArmed      bool
 	connected      bool
 	keepAlive      time.Duration
 	closed         chan struct{}
@@ -350,6 +364,25 @@ func (c *incomingConn) reader() {
 			}
 			c.clientid = m.ClientId
 			c.keepAlive = time.Duration(m.KeepAliveTimer) * time.Second
+			if rc == proto.RetCodeAccepted && c.svr.options.Authenticator != nil {
+				err := c.svr.options.Authenticator.Authenticate(c.svr.ctx, AuthRequest{
+					ClientID:        m.ClientId,
+					Username:        m.Username,
+					Password:        []byte(m.Password),
+					UsernamePresent: m.UsernameFlag,
+					PasswordPresent: m.PasswordFlag,
+					ProtocolVersion: c.version,
+					RemoteAddr:      c.conn.RemoteAddr(),
+					Properties:      append(proto.Properties(nil), m.Properties...),
+				})
+				if err != nil {
+					if errors.Is(err, ErrBadCredentials) {
+						rc = proto.ReturnCode(4)
+					} else {
+						rc = proto.ReturnCode(5)
+					}
+				}
+			}
 			sessionPresent := false
 			if rc == proto.RetCodeAccepted {
 				// Only an accepted CONNECT may take over an existing ClientID.
@@ -365,17 +398,22 @@ func (c *incomingConn) reader() {
 					c.svr.clients[c.clientid] = c
 					c.svr.clientsMu.Unlock()
 				}
+				c.svr.resolvePendingWill(c.clientid, m.CleanSession)
 				sessionPresent = c.svr.attachSession(c, m)
+				c.configureWill(m)
 			}
-
-			// TODO: Last will
 
 			connack := &proto.ConnAck{ReturnCode: rc, SessionPresent: sessionPresent}
 			if c.version == proto.Version5 && rc != proto.RetCodeAccepted {
-				if rc == proto.RetCodeUnacceptableProtocolVersion {
+				switch rc {
+				case proto.RetCodeUnacceptableProtocolVersion:
 					connack.ReturnCode = proto.ReturnCode(0x84)
-				} else if rc == proto.RetCodeIdentifierRejected {
+				case proto.RetCodeIdentifierRejected:
 					connack.ReturnCode = proto.ReturnCode(0x85)
+				case proto.ReturnCode(4):
+					connack.ReturnCode = proto.ReturnCode(0x86)
+				case proto.ReturnCode(5):
+					connack.ReturnCode = proto.ReturnCode(0x87)
 				}
 			}
 			if c.version == proto.Version5 && !c.svr.options.EnableQoS2 {
@@ -565,6 +603,9 @@ func (c *incomingConn) reader() {
 
 		case *proto.Disconnect:
 			c.svr.updateSessionExpiry(c, m.Properties)
+			if c.version != proto.Version5 || m.ReasonCode == 0 {
+				c.discardWill()
+			}
 			return
 
 		default:
@@ -578,6 +619,7 @@ func (c *incomingConn) writer() {
 	defer func() {
 		c.stop()
 		c.del()
+		c.svr.scheduleWill(c)
 		c.svr.detachSession(c)
 		close(c.done)
 	}()
