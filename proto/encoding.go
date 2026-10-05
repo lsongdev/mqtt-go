@@ -142,6 +142,9 @@ func decodeLength(r io.Reader) int32 {
 		v |= int32(b&0x7f) << shift
 
 		if b&0x80 == 0 {
+			if i > 0 && b&0x7f == 0 {
+				raiseError(badLengthEncodingError)
+			}
 			return v
 		}
 		shift += 7
@@ -165,6 +168,9 @@ func decodeLengthCounted(r io.Reader, remaining *int32) int32 {
 		*remaining--
 		v += int32(b[0]&127) * multiplier
 		if b[0]&128 == 0 {
+			if i > 0 && b[0]&127 == 0 {
+				raiseError(badLengthEncodingError)
+			}
 			return v
 		}
 		multiplier *= 128
