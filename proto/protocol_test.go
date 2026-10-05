@@ -149,7 +149,6 @@ func TestPropertyTypeIsChecked(t *testing.T) {
 	}
 }
 
-
 func TestRejectsZeroPacketIdentifiers(t *testing.T) {
 	cases := []Message{
 		&Publish{Header: Header{QosLevel: QosAtLeastOnce}, TopicName: "a", MessageId: 0, Payload: BytesPayload("x")},
@@ -210,7 +209,6 @@ func FuzzDecodeOneMessage(f *testing.F) {
 		_, _ = DecodeOneMessage(bytes.NewReader(data), &DecodeOptions{MaxPacketSize: 1 << 20})
 	})
 }
-
 
 func TestMQTT5PropertyContextAndValueValidation(t *testing.T) {
 	if err := (&Auth{
