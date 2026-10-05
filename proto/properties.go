@@ -2,8 +2,10 @@ package proto
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // PropertyID identifies an MQTT 5 property. Property values use the natural
@@ -74,6 +76,147 @@ var propertyTypes = map[PropertyID]propertyWireType{
 	0x28: propertyByte, 0x29: propertyByte, 0x2A: propertyByte,
 }
 
+type propertyContext uint8
+
+const (
+	propertiesConnect propertyContext = iota
+	propertiesWill
+	propertiesConnAck
+	propertiesPublish
+	propertiesAck
+	propertiesSubscribe
+	propertiesSubAck
+	propertiesUnsubscribe
+	propertiesUnsubAck
+	propertiesDisconnect
+	propertiesAuth
+)
+
+func propertySet(ids ...PropertyID) map[PropertyID]struct{} {
+	out := make(map[PropertyID]struct{}, len(ids))
+	for _, id := range ids {
+		out[id] = struct{}{}
+	}
+	return out
+}
+
+var allowedProperties = map[propertyContext]map[PropertyID]struct{}{
+	propertiesConnect: propertySet(
+		PropertySessionExpiryInterval, PropertyReceiveMaximum, PropertyMaximumPacketSize,
+		PropertyTopicAliasMaximum, PropertyRequestResponseInformation, PropertyRequestProblemInformation,
+		PropertyUserProperty, PropertyAuthenticationMethod, PropertyAuthenticationData,
+	),
+	propertiesWill: propertySet(
+		PropertyWillDelayInterval, PropertyPayloadFormatIndicator, PropertyMessageExpiryInterval,
+		PropertyContentType, PropertyResponseTopic, PropertyCorrelationData, PropertyUserProperty,
+	),
+	propertiesConnAck: propertySet(
+		PropertySessionExpiryInterval, PropertyReceiveMaximum, PropertyMaximumQoS, PropertyRetainAvailable,
+		PropertyMaximumPacketSize, PropertyAssignedClientIdentifier, PropertyTopicAliasMaximum,
+		PropertyReasonString, PropertyUserProperty, PropertyWildcardSubscriptionAvailable,
+		PropertySubscriptionIdentifierAvailable, PropertySharedSubscriptionAvailable, PropertyServerKeepAlive,
+		PropertyResponseInformation, PropertyServerReference, PropertyAuthenticationMethod, PropertyAuthenticationData,
+	),
+	propertiesPublish: propertySet(
+		PropertyPayloadFormatIndicator, PropertyMessageExpiryInterval, PropertyTopicAlias,
+		PropertyResponseTopic, PropertyCorrelationData, PropertyUserProperty,
+		PropertySubscriptionIdentifier, PropertyContentType,
+	),
+	propertiesAck:         propertySet(PropertyReasonString, PropertyUserProperty),
+	propertiesSubscribe:   propertySet(PropertySubscriptionIdentifier, PropertyUserProperty),
+	propertiesSubAck:      propertySet(PropertyReasonString, PropertyUserProperty),
+	propertiesUnsubscribe: propertySet(PropertyUserProperty),
+	propertiesUnsubAck:    propertySet(PropertyReasonString, PropertyUserProperty),
+	propertiesDisconnect: propertySet(PropertySessionExpiryInterval, PropertyReasonString, PropertyUserProperty, PropertyServerReference),
+	propertiesAuth:        propertySet(PropertyAuthenticationMethod, PropertyAuthenticationData, PropertyReasonString, PropertyUserProperty),
+}
+
+func validateProperties(ctx propertyContext, props Properties) error {
+	allowed := allowedProperties[ctx]
+	seen := make(map[PropertyID]int, len(props))
+	hasAuthMethod := false
+	hasAuthData := false
+	for _, p := range props {
+		if _, ok := allowed[p.ID]; !ok {
+			return fmt.Errorf("mqtt: property 0x%x is not valid in this packet", byte(p.ID))
+		}
+		seen[p.ID]++
+		repeatable := p.ID == PropertyUserProperty || (ctx == propertiesPublish && p.ID == PropertySubscriptionIdentifier)
+		if seen[p.ID] > 1 && !repeatable {
+			return fmt.Errorf("mqtt: property 0x%x must not appear more than once", byte(p.ID))
+		}
+
+		switch p.ID {
+		case PropertyPayloadFormatIndicator, PropertyRequestProblemInformation, PropertyRequestResponseInformation,
+			PropertyMaximumQoS, PropertyRetainAvailable, PropertyWildcardSubscriptionAvailable,
+			PropertySubscriptionIdentifierAvailable, PropertySharedSubscriptionAvailable:
+			v, ok := p.Value.(byte)
+			if !ok {
+				return propertyTypeError(p, "byte")
+			}
+			if v > 1 {
+				return fmt.Errorf("mqtt: property 0x%x must be 0 or 1", byte(p.ID))
+			}
+		case PropertyReceiveMaximum:
+			v, ok := p.Value.(uint16)
+			if !ok {
+				return propertyTypeError(p, "uint16")
+			}
+			if v == 0 {
+				return errors.New("mqtt: receive maximum must be non-zero")
+			}
+		case PropertyTopicAlias:
+			v, ok := p.Value.(uint16)
+			if !ok {
+				return propertyTypeError(p, "uint16")
+			}
+			if v == 0 {
+				return errors.New("mqtt: topic alias must be non-zero")
+			}
+		case PropertyMaximumPacketSize:
+			v, ok := p.Value.(uint32)
+			if !ok {
+				return propertyTypeError(p, "uint32")
+			}
+			if v == 0 {
+				return errors.New("mqtt: maximum packet size must be non-zero")
+			}
+		case PropertySubscriptionIdentifier:
+			v, ok := p.Value.(VarInt)
+			if !ok {
+				return propertyTypeError(p, "proto.VarInt")
+			}
+			if v == 0 || uint32(v) > uint32(MaxPayloadSize) {
+				return errors.New("mqtt: subscription identifier is out of range")
+			}
+		case PropertyResponseTopic:
+			v, ok := p.Value.(string)
+			if !ok {
+				return propertyTypeError(p, "string")
+			}
+			if v == "" || strings.ContainsAny(v, "+#") {
+				return errors.New("mqtt: response topic must be a non-empty topic name")
+			}
+		case PropertyAssignedClientIdentifier:
+			v, ok := p.Value.(string)
+			if !ok {
+				return propertyTypeError(p, "string")
+			}
+			if v == "" {
+				return errors.New("mqtt: assigned client identifier must be non-empty")
+			}
+		case PropertyAuthenticationMethod:
+			hasAuthMethod = true
+		case PropertyAuthenticationData:
+			hasAuthData = true
+		}
+	}
+	if hasAuthData && !hasAuthMethod {
+		return errors.New("mqtt: authentication data requires authentication method")
+	}
+	return nil
+}
+
 func (p Properties) Add(id PropertyID, value any) Properties {
 	return append(p, Property{ID: id, Value: value})
 }
@@ -87,7 +230,10 @@ func (p Properties) Values(id PropertyID) []any {
 	return out
 }
 
-func encodeProperties(dst *bytes.Buffer, props Properties) error {
+func encodeProperties(dst *bytes.Buffer, props Properties, ctx propertyContext) error {
+	if err := validateProperties(ctx, props); err != nil {
+		return err
+	}
 	var body bytes.Buffer
 	for _, p := range props {
 		wt, ok := propertyTypes[p.ID]
@@ -150,7 +296,7 @@ func propertyTypeError(p Property, want string) error {
 	return fmt.Errorf("mqtt: property 0x%x requires %s, got %T", byte(p.ID), want, p.Value)
 }
 
-func decodeProperties(r io.Reader, remaining *int32) Properties {
+func decodeProperties(r io.Reader, remaining *int32, ctx propertyContext) Properties {
 	n := decodeLengthCounted(r, remaining)
 	if n > *remaining {
 		raiseError(dataExceedsPacketError)
@@ -184,5 +330,8 @@ func decodeProperties(r io.Reader, remaining *int32) Properties {
 		props = append(props, Property{ID: id, Value: value})
 	}
 	*remaining -= int32(n)
+	if err := validateProperties(ctx, props); err != nil {
+		raiseError(err)
+	}
 	return props
 }
