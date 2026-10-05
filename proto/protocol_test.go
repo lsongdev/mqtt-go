@@ -307,3 +307,16 @@ func TestTopicValidation(t *testing.T) {
 		t.Fatal("accepted invalid UTF-8 topic")
 	}
 }
+
+
+func TestPublishRejectsInvalidStreamingPayloadSize(t *testing.T) {
+	for _, size := range []int{-1, MaxPayloadSize + 1} {
+		message := &Publish{
+			TopicName: "stream",
+			Payload:   &StreamedPayload{N: size, EncodingSource: bytes.NewReader(nil)},
+		}
+		if err := message.Encode(new(bytes.Buffer)); err == nil {
+			t.Fatalf("accepted payload size %d", size)
+		}
+	}
+}
