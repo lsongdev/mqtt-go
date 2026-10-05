@@ -76,6 +76,9 @@ func (o ClientOptions) normalized() ClientOptions {
 	if o.ProtocolVersion == 0 {
 		o.ProtocolVersion = proto.Version311
 	}
+	if o.MaxPacketSize == 0 {
+		o.MaxPacketSize = DefaultMaxPacketSize
+	}
 	if o.ClientID == "" {
 		o.CleanStart = true
 	}
