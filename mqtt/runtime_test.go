@@ -252,3 +252,23 @@ func TestServerCloseClosesPreConnectTransport(t *testing.T) {
 		t.Fatalf("Server.Close did not close pre-CONNECT transport: %v", err)
 	}
 }
+
+
+func TestServeConnAfterServerCloseClosesTransport(t *testing.T) {
+	server := NewServer()
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	serverSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+	server.ServeConn(serverSide)
+
+	_ = clientSide.SetReadDeadline(time.Now().Add(time.Second))
+	var one [1]byte
+	if _, err := clientSide.Read(one[:]); err == nil {
+		t.Fatal("ServeConn accepted a transport after Server.Close")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatalf("transport was left open after Server.Close: %v", err)
+	}
+}
