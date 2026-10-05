@@ -35,8 +35,8 @@ func init() {
 // Concurrent access to a ClientConn is NOT safe.
 type ClientConn struct {
 	conn            net.Conn
-	ClientId        string        // May be set before the call to Connect.
-	id              uint16        // next packet identifier
+	ClientId        string // May be set before the call to Connect.
+	id              uint16 // next packet identifier
 	idMu            sync.Mutex
 	packetIDs       map[uint16]struct{}
 	done            chan struct{} // This channel will be readable once a Disconnect has been successfully sent and the connection is closed.
