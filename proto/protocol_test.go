@@ -269,7 +269,7 @@ func TestTopicValidation(t *testing.T) {
 	if err := (&Publish{
 		Header: Header{Version: Version5}, TopicName: "",
 		Properties: Properties{}.Add(PropertyTopicAlias, uint16(1)),
-		Payload: BytesPayload("x"),
+		Payload:    BytesPayload("x"),
 	}).Encode(new(bytes.Buffer)); err != nil {
 		t.Fatalf("rejected MQTT 5 topic alias publish: %v", err)
 	}
