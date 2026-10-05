@@ -271,17 +271,29 @@ func encodeProperties(dst *bytes.Buffer, props Properties, ctx propertyContext) 
 			if !ok {
 				return propertyTypeError(p, "[]byte")
 			}
+			if err := validateLengthPrefixed(len(v)); err != nil {
+				return err
+			}
 			setBinary(v, &body)
 		case propertyString:
 			v, ok := p.Value.(string)
 			if !ok {
 				return propertyTypeError(p, "string")
 			}
+			if err := validateUTF8String(v); err != nil {
+				return err
+			}
 			setString(v, &body)
 		case propertyStringPair:
 			v, ok := p.Value.(StringPair)
 			if !ok {
 				return propertyTypeError(p, "proto.StringPair")
+			}
+			if err := validateUTF8String(v.Key); err != nil {
+				return err
+			}
+			if err := validateUTF8String(v.Value); err != nil {
+				return err
 			}
 			setString(v.Key, &body)
 			setString(v.Value, &body)
