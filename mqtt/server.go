@@ -57,6 +57,9 @@ func NewServer() *Server {
 // NewServerWithOptions creates a broker with explicitly enabled optional
 // features. It restores unexpired sessions before accepting connections.
 func NewServerWithOptions(options ServerOptions) (*Server, error) {
+	if options.MaxPacketSize == 0 {
+		options.MaxPacketSize = DefaultMaxPacketSize
+	}
 	svr := &Server{
 		// l:             l,
 		Done:          make(chan struct{}),
