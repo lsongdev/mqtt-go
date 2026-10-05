@@ -308,7 +308,6 @@ func TestTopicValidation(t *testing.T) {
 	}
 }
 
-
 func TestPublishRejectsInvalidStreamingPayloadSize(t *testing.T) {
 	for _, size := range []int{-1, MaxPayloadSize + 1} {
 		message := &Publish{
