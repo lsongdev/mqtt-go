@@ -651,8 +651,7 @@ func (s subscription) clientID() string {
 	return ""
 }
 
-// The length of the queue that subscription processing
-// workers are taking from.
+// The length of the ordered subscription dispatcher queue.
 const postQueue = 100
 
 func newSubscriptions() *subscriptions {
@@ -684,6 +683,9 @@ func (s *subscriptions) sendRetain(tq proto.TopicQos, c *incomingConn) {
 			}
 			if m.QosLevel.HasId() {
 				m.MessageId = c.nextMessageID()
+				if m.MessageId == 0 {
+					continue
+				}
 			}
 			messages = append(messages, m)
 		}
@@ -904,7 +906,7 @@ func (s *subscriptions) unsub(topic string, c *incomingConn) {
 	s.mu.Unlock()
 }
 
-// The subscription processing worker.
+// run is the ordered subscription dispatcher.
 func (s *subscriptions) run() {
 	for post := range s.posts {
 		// Remember the original retain setting, but send out immediate
@@ -940,6 +942,9 @@ func (s *subscriptions) run() {
 			if sub.c != nil {
 				if out.QosLevel.HasId() {
 					out.MessageId = sub.c.nextMessageID()
+					if out.MessageId == 0 {
+						continue
+					}
 				} else {
 					out.MessageId = 0
 				}
