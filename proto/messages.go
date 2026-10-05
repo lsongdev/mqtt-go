@@ -932,7 +932,7 @@ func (msg *Connect) Validate() error {
 	if msg.ReservedBit != 0 {
 		return errors.New("connect reserved bit must be 0")
 	}
-	if len(msg.ClientId) == 0 && !msg.CleanSession {
+	if msg.ProtocolVersion != 5 && len(msg.ClientId) == 0 && !msg.CleanSession {
 		return errors.New("empty client id requires clean session")
 	}
 	if msg.ProtocolVersion == 3 && (len(msg.ClientId) < 1 || len(msg.ClientId) > 23) {
@@ -982,10 +982,10 @@ func validate311(msg Message) error {
 				return err
 			}
 		}
-		if m.PasswordFlag && !m.UsernameFlag {
+		if m.ProtocolVersion != 5 && m.PasswordFlag && !m.UsernameFlag {
 			return errors.New("password flag requires username flag")
 		}
-		if len(m.ClientId) == 0 && !m.CleanSession {
+		if m.ProtocolVersion != 5 && len(m.ClientId) == 0 && !m.CleanSession {
 			return errors.New("empty client id requires clean start/session")
 		}
 

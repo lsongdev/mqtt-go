@@ -251,6 +251,10 @@ go test -fuzz=FuzzDecodeOneMessage ./proto
 ```
 
 CI enforces formatting, vet, unit/integration tests, and the race detector.
+An additional interoperability job uses independent Eclipse Paho Python
+clients against the embedded broker over TCP and WebSocket, and the Go client
+against a local Eclipse Mosquitto broker. Run it with `make interop` after
+installing the tools described in [docs/interoperability.md](docs/interoperability.md).
 The suite covers exact v4/v5 wire encodings, malformed and truncated packets,
 MQTT 5 property contexts and value constraints, topic/filter syntax, packet
 identifier wraparound, packet-size limits, retained-message semantics,
@@ -268,6 +272,12 @@ challenge/response authentication (AUTH exchange), per-topic authorization,
 and persistence of pending delayed Wills across a broker process restart are
 not implemented. These boundaries remain explicit rather than presenting
 partial semantics as complete support.
+
+The broker advertises Subscription Identifiers as unavailable and rejects
+subscriptions requesting them. Topic Alias Maximum is zero; incoming aliases
+are rejected with MQTT 5 reason `0x94`. Enhanced authentication requests are
+rejected at CONNACK with reason `0x8c`. When persistent sessions are disabled,
+the broker overrides a requested MQTT 5 Session Expiry Interval to zero.
 
 ## License
 

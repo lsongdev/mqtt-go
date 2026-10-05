@@ -1,5 +1,11 @@
 BINARY_NAME=bin/mqtt
 
+.PHONY: build clean interop
+
+# Requires Mosquitto and Paho; see docs/interoperability.md for installation.
+interop:
+	go test -race -tags interop ./mqtt -run TestInterop -v -count=1 -timeout 180s
+
 build:
 	mkdir -p bin
 	GOARCH=arm64 GOOS=darwin go build -ldflags="-s -w" -o ${BINARY_NAME}-darwin-arm64 ./cmd/mqtt

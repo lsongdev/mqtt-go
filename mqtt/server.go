@@ -2,6 +2,7 @@ package mqtt
 
 import (
 	"context"
+	crand "crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -30,7 +31,6 @@ type Server struct {
 	cancel        context.CancelFunc
 	sessionsMu    sync.Mutex
 	sessions      map[string]*sessionState
-	clientSeq     uint64
 	willsMu       sync.Mutex
 	wills         map[string]*pendingWill
 	closeOnce     sync.Once
@@ -140,6 +140,8 @@ func (s *Server) newIncomingConn(conn net.Conn) *incomingConn {
 		packetIDs:      make(map[uint16]struct{}),
 		closed:         make(chan struct{}),
 		done:           make(chan struct{}),
+		receiveMaximum: ^uint16(0),
+		publishAcks:    make(chan uint16, sendingQueueLength),
 	}
 }
 
@@ -230,6 +232,8 @@ type incomingConn struct {
 	closed         chan struct{}
 	closeOnce      sync.Once
 	done           chan struct{}
+	receiveMaximum uint16 // Peer limit on unacknowledged QoS 1/2 PUBLISH packets.
+	publishAcks    chan uint16
 }
 
 // Start reading and writing on this connection.
@@ -356,16 +360,28 @@ func (c *incomingConn) reader() {
 			}
 
 			// Check client id.
-			if len(m.ClientId) < 1 && !m.CleanSession {
+			if c.version != proto.Version5 && len(m.ClientId) < 1 && !m.CleanSession {
 				rc = proto.RetCodeIdentifierRejected
 			}
 			assignedClientID := false
 			if rc == proto.RetCodeAccepted && m.ClientId == "" {
-				m.ClientId = fmt.Sprintf("mqtt-%d", atomic.AddUint64(&c.svr.clientSeq, 1))
+				var random [16]byte
+				if _, err := crand.Read(random[:]); err != nil {
+					return
+				}
+				m.ClientId = fmt.Sprintf("mqtt-%x", random)
 				assignedClientID = true
 			}
 			c.clientid = m.ClientId
 			c.keepAlive = time.Duration(m.KeepAliveTimer) * time.Second
+			if maximum, ok := propertyUint16(m.Properties, proto.PropertyReceiveMaximum); ok {
+				c.receiveMaximum = maximum
+			}
+			if c.version == proto.Version5 && len(m.Properties.Values(proto.PropertyAuthenticationMethod)) > 0 {
+				// Enhanced authentication is not implemented; never accept it as
+				// ordinary CONNECT authentication without performing the exchange.
+				rc = proto.ReturnCode(0x8c)
+			}
 			if rc == proto.RetCodeAccepted && c.svr.options.Authenticator != nil {
 				err := c.svr.options.Authenticator.Authenticate(c.svr.ctx, AuthRequest{
 					ClientID:        m.ClientId,
@@ -423,6 +439,10 @@ func (c *incomingConn) reader() {
 			}
 			if c.version == proto.Version5 {
 				connack.Properties = connack.Properties.Add(proto.PropertySharedSubscriptionAvailable, boolToProperty(c.svr.options.EnableSharedSubscriptions))
+				connack.Properties = connack.Properties.Add(proto.PropertySubscriptionIdentifierAvailable, byte(0))
+				if expiry, _ := propertyUint32(m.Properties, proto.PropertySessionExpiryInterval); expiry > 0 && !c.svr.persistentSessionsEnabled() {
+					connack.Properties = connack.Properties.Add(proto.PropertySessionExpiryInterval, uint32(0))
+				}
 				if assignedClientID {
 					connack.Properties = connack.Properties.Add(proto.PropertyAssignedClientIdentifier, c.clientid)
 				}
@@ -431,7 +451,7 @@ func (c *incomingConn) reader() {
 			if rc != proto.RetCodeAccepted {
 				r := c.submitSync(connack)
 				_ = r.wait()
-				log.Printf("Connection refused for %v: %v", c.conn.RemoteAddr(), ConnectionErrors[rc])
+				log.Printf("Connection refused for %v: reason code 0x%02x", c.conn.RemoteAddr(), connack.ReturnCode)
 				return
 			}
 			c.submit(connack)
@@ -447,6 +467,12 @@ func (c *incomingConn) reader() {
 
 		case *proto.Publish:
 			if !c.connected {
+				return
+			}
+			if c.version == proto.Version5 && len(m.Properties.Values(proto.PropertyTopicAlias)) > 0 {
+				// Topic Alias Maximum defaults to zero in our CONNACK. Aliases
+				// belong to one connection and must never leak into routed packets.
+				_ = c.submitSync(&proto.Disconnect{ReasonCode: 0x94}).wait()
 				return
 			}
 			if m.Header.QosLevel == proto.QosExactlyOnce {
@@ -497,7 +523,14 @@ func (c *incomingConn) reader() {
 			c.qosMu.Lock()
 			_, ok := c.outgoingQoS2[m.MessageId]
 			storedID := c.outgoingStored[m.MessageId]
+			if m.ReasonCode >= 0x80 {
+				delete(c.outgoingQoS2, m.MessageId)
+			}
 			c.qosMu.Unlock()
+			if m.ReasonCode >= 0x80 {
+				c.ackOutgoing(m.MessageId)
+				continue
+			}
 			if ok {
 				if storedID != 0 {
 					c.svr.markSessionDelivery(c.session, storedID, m.MessageId, 1)
@@ -551,6 +584,11 @@ func (c *incomingConn) reader() {
 			}
 			newSubscriptions := make([]bool, len(m.Topics))
 			for i, tq := range m.Topics {
+				if c.version == proto.Version5 && len(m.Properties.Values(proto.PropertySubscriptionIdentifier)) > 0 {
+					suback.TopicsQos[i] = proto.QosLevel(0x80)
+					suback.ReasonCodes[i] = 0xa1
+					continue
+				}
 				group, filter, valid := parseSharedFilter(tq.Topic)
 				sharedUnsupported := group != "" && !c.svr.options.EnableSharedSubscriptions
 				if !valid || sharedUnsupported || (group != "" && tq.NoLocal) || filter == "" || (isWildcard(filter) && !newWild(filter, nil).valid()) {
@@ -581,6 +619,7 @@ func (c *incomingConn) reader() {
 			// Process retained messages.
 			for i, tq := range m.Topics {
 				if suback.TopicsQos[i] != proto.QosLevel(0x80) && tq.RetainHandling != 2 && (tq.RetainHandling == 0 || newSubscriptions[i]) {
+					tq.Qos = suback.TopicsQos[i]
 					c.svr.subs.sendRetain(tq, c)
 				}
 			}
@@ -594,13 +633,16 @@ func (c *incomingConn) reader() {
 				log.Printf("reader: invalid MessageId in UNSUBSCRIBE.")
 				return
 			}
-			for _, t := range m.Topics {
-				c.svr.subs.unsub(t, c)
-				c.svr.removeSubscription(c, t)
-			}
 			ack := &proto.UnsubAck{MessageId: m.MessageId}
 			if c.version == proto.Version5 {
 				ack.ReasonCodes = make([]proto.ReasonCode, len(m.Topics))
+			}
+			for i, topic := range m.Topics {
+				existed := c.svr.subs.unsub(topic, c)
+				c.svr.removeSubscription(c, topic)
+				if c.version == proto.Version5 && !existed {
+					ack.ReasonCodes[i] = 0x11
+				}
 			}
 			c.submit(ack)
 
@@ -622,18 +664,59 @@ func (c *incomingConn) writer() {
 	defer func() {
 		c.stop()
 		c.del()
-		c.svr.scheduleWill(c)
 		c.svr.detachSession(c)
+		c.svr.scheduleWill(c)
 		close(c.done)
 	}()
 
+	// Keep control packets moving while a peer's Receive Maximum blocks
+	// further PUBLISH packets. Only acknowledgements for inflight packets
+	// release quota; duplicate/unknown ACKs cannot increase it.
+	inflight := make(map[uint16]struct{})
+	var pending []job
 	for {
-		var job job
-		select {
-		case job = <-c.jobs:
-		case <-c.closed:
-			return
+		var next job
+		fromPending := false
+		if len(pending) > 0 && len(inflight) < int(c.receiveMaximum) {
+			next = pending[0]
+			pending[0] = job{}
+			pending = pending[1:]
+			fromPending = true
+		} else {
+			select {
+			case id := <-c.publishAcks:
+				delete(inflight, id)
+				continue
+			case next = <-c.jobs:
+			case <-c.closed:
+				return
+			}
 		}
+		if publish, ok := next.m.(*proto.Publish); ok && publish.QosLevel.HasId() {
+			// ACK notifications precede identifier reuse. Drain them before
+			// checking a newly queued PUBLISH with a possibly reused identifier.
+		acknowledgements:
+			for {
+				select {
+				case id := <-c.publishAcks:
+					delete(inflight, id)
+				default:
+					break acknowledgements
+				}
+			}
+			if _, alreadySent := inflight[publish.MessageId]; !alreadySent {
+				if len(inflight) >= int(c.receiveMaximum) || (!fromPending && len(pending) > 0) {
+					if len(pending) >= sendingQueueLength {
+						c.stop()
+						return
+					}
+					pending = append(pending, next)
+					continue
+				}
+				inflight[publish.MessageId] = struct{}{}
+			}
+		}
+		job := next
 		if c.svr.Dump {
 			log.Printf("dump out: %T", job.m)
 		}
@@ -730,9 +813,12 @@ func newSubscriptions() *subscriptions {
 }
 
 func (s *subscriptions) sendRetain(tq proto.TopicQos, c *incomingConn) {
+	group, filter, _ := parseSharedFilter(tq.Topic)
+	if group != "" {
+		return
+	}
 	s.mu.Lock()
 	var messages []proto.Publish
-	_, filter, _ := parseSharedFilter(tq.Topic)
 	w := newWild(filter, nil)
 	for name, retained := range s.retain {
 		if strings.HasPrefix(name, "$") && !strings.HasPrefix(filter, "$") {
@@ -740,6 +826,7 @@ func (s *subscriptions) sendRetain(tq proto.TopicQos, c *incomingConn) {
 		}
 		if (!isWildcard(filter) && name == filter) || (isWildcard(filter) && w.matches(strings.Split(name, "/"))) {
 			m := retained.m
+			m.DupFlag = false
 			if m.QosLevel > tq.Qos {
 				m.QosLevel = tq.Qos
 			}
@@ -938,25 +1025,30 @@ func (s *subscriptions) unsubAll(c *incomingConn) {
 }
 
 // Remove the subscription to topic for a given connection.
-func (s *subscriptions) unsub(topic string, c *incomingConn) {
+func (s *subscriptions) unsub(topic string, c *incomingConn) bool {
 	s.mu.Lock()
+	existed := false
 	_, filter, _ := parseSharedFilter(topic)
 	if isWildcard(filter) {
 		filtered := s.wildcards[:0]
 		for _, w := range s.wildcards {
 			if w.sub.clientID() != c.clientid || w.sub.filter != topic {
 				filtered = append(filtered, w)
+			} else {
+				existed = true
 			}
 		}
 		s.wildcards = filtered
 		s.mu.Unlock()
-		return
+		return existed
 	}
 	if conns, ok := s.subs[filter]; ok {
 		out := conns[:0]
 		for _, sub := range conns {
 			if sub.clientID() != c.clientid || sub.filter != topic {
 				out = append(out, sub)
+			} else {
+				existed = true
 			}
 		}
 		if len(out) == 0 {
@@ -966,6 +1058,7 @@ func (s *subscriptions) unsub(topic string, c *incomingConn) {
 		}
 	}
 	s.mu.Unlock()
+	return existed
 }
 
 // run is the ordered subscription dispatcher.
@@ -1001,6 +1094,7 @@ func (s *subscriptions) run() {
 			}
 
 			out := *post.m
+			out.DupFlag = false
 			if out.QosLevel > sub.qos {
 				out.QosLevel = sub.qos
 			}

@@ -54,9 +54,10 @@ type SessionStore interface {
 
 type sessionState struct {
 	StoredSession
-	conn        *incomingConn
-	nextQueueID uint64
-	server      *Server
+	conn           *incomingConn
+	nextQueueID    uint64
+	server         *Server
+	expiryInterval uint32 // MQTT 5 lifetime after transport disconnects.
 }
 
 func propertyUint32(properties proto.Properties, id proto.PropertyID) (uint32, bool) {
@@ -69,16 +70,24 @@ func propertyUint32(properties proto.Properties, id proto.PropertyID) (uint32, b
 	return 0, false
 }
 
+func propertyUint16(properties proto.Properties, id proto.PropertyID) (uint16, bool) {
+	for _, p := range properties {
+		if p.ID == id {
+			value, ok := p.Value.(uint16)
+			return value, ok
+		}
+	}
+	return 0, false
+}
+
 func (s *Server) attachSession(c *incomingConn, connect *proto.Connect) bool {
 	enabled := s.persistentSessionsEnabled()
 	persistent := enabled && !connect.CleanSession
-	var expires time.Time
+	var expiryInterval uint32
 	if c.version == proto.Version5 {
 		seconds, _ := propertyUint32(connect.Properties, proto.PropertySessionExpiryInterval)
 		persistent = enabled && seconds > 0
-		if seconds > 0 && seconds != ^uint32(0) {
-			expires = time.Now().Add(time.Duration(seconds) * time.Second)
-		}
+		expiryInterval = seconds
 	}
 	s.sessionsMu.Lock()
 	defer s.sessionsMu.Unlock()
@@ -98,7 +107,10 @@ func (s *Server) attachSession(c *incomingConn, connect *proto.Connect) bool {
 		state = &sessionState{StoredSession: StoredSession{ClientID: connect.ClientId}, server: s}
 	}
 	state.server = s
-	state.ExpiresAt = expires
+	// A connected Session never expires. Its expiry clock starts only after
+	// the Network Connection closes, including when a resumed Session closes.
+	state.ExpiresAt = time.Time{}
+	state.expiryInterval = expiryInterval
 	state.conn = c
 	c.session = state
 	c.persistent = persistent
@@ -137,6 +149,9 @@ func (s *Server) detachSession(c *incomingConn) {
 	defer s.sessionsMu.Unlock()
 	if c.persistent {
 		c.session.conn = nil
+		if c.version == proto.Version5 && c.session.expiryInterval != ^uint32(0) {
+			c.session.ExpiresAt = time.Now().Add(time.Duration(c.session.expiryInterval) * time.Second)
+		}
 		s.sessions[c.clientid] = c.session
 		s.subs.detach(c, true)
 		s.saveSession(c.session)
@@ -159,12 +174,8 @@ func (s *Server) updateSessionExpiry(c *incomingConn, properties proto.Propertie
 	}
 	s.sessionsMu.Lock()
 	defer s.sessionsMu.Unlock()
-	c.persistent = seconds > 0
-	if seconds == 0 || seconds == ^uint32(0) {
-		c.session.ExpiresAt = time.Time{}
-	} else {
-		c.session.ExpiresAt = time.Now().Add(time.Duration(seconds) * time.Second)
-	}
+	c.persistent = s.persistentSessionsEnabled() && seconds > 0
+	c.session.expiryInterval = seconds
 }
 
 func (s *Server) recordSubscription(c *incomingConn, tq proto.TopicQos) {
@@ -336,7 +347,6 @@ func (c *incomingConn) trackAndSubmit(message *proto.Publish, storedID uint64) {
 }
 
 func (c *incomingConn) ackOutgoing(packetID uint16) {
-	c.releaseMessageID(packetID)
 	c.qosMu.Lock()
 	storedID := c.outgoingStored[packetID]
 	delete(c.outgoingStored, packetID)
@@ -344,6 +354,13 @@ func (c *incomingConn) ackOutgoing(packetID uint16) {
 	if storedID != 0 {
 		c.svr.ackSession(c.session, storedID)
 	}
+	select {
+	case c.publishAcks <- packetID:
+	case <-c.closed:
+	default:
+		c.stop()
+	}
+	c.releaseMessageID(packetID)
 }
 
 func storedPublish(m *proto.Publish) (StoredMessage, bool) {

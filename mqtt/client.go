@@ -57,6 +57,7 @@ type ClientConn struct {
 	qosMu           sync.Mutex
 	incomingQoS2    map[uint16]*proto.Publish
 	outgoingQoS2    map[uint16]*proto.Publish
+	maximumQoS      proto.QosLevel
 }
 
 // ClientOptions configures the modern Dial API.
@@ -91,7 +92,7 @@ func (o ClientOptions) normalized() ClientOptions {
 	if o.MaxPacketSize == 0 {
 		o.MaxPacketSize = DefaultMaxPacketSize
 	}
-	if o.ClientID == "" {
+	if o.ClientID == "" && o.ProtocolVersion != proto.Version5 {
 		o.CleanStart = true
 	}
 	return o
@@ -118,6 +119,7 @@ func NewClientConn(c net.Conn) *ClientConn {
 		decode:          decode,
 		incomingQoS2:    make(map[uint16]*proto.Publish),
 		outgoingQoS2:    make(map[uint16]*proto.Publish),
+		maximumQoS:      proto.QosExactlyOnce,
 	}
 	go cc.reader()
 	go cc.writer()
@@ -199,7 +201,14 @@ func (c *ClientConn) reader() {
 		case *proto.PubRec:
 			c.qosMu.Lock()
 			_, ok := c.outgoingQoS2[m.MessageId]
+			if m.ReasonCode >= 0x80 {
+				delete(c.outgoingQoS2, m.MessageId)
+			}
 			c.qosMu.Unlock()
+			if m.ReasonCode >= 0x80 {
+				c.releaseid(m.MessageId)
+				continue
+			}
 			if ok {
 				c.send(&proto.PubRel{MessageId: m.MessageId})
 			}
@@ -349,6 +358,13 @@ func (c *ClientConn) ConnectWithOptions(options ClientOptions) error {
 	}
 	if ack.ReturnCode == proto.RetCodeAccepted {
 		c.SessionPresent = ack.SessionPresent
+		if options.ProtocolVersion == proto.Version5 {
+			for _, property := range ack.Properties {
+				if property.ID == proto.PropertyMaximumQoS {
+					c.maximumQoS = proto.QosLevel(property.Value.(byte))
+				}
+			}
+		}
 		if requestedAssignedID {
 			assigned, ok := propertyString(ack.Properties, proto.PropertyAssignedClientIdentifier)
 			if !ok || assigned == "" {
@@ -357,8 +373,14 @@ func (c *ClientConn) ConnectWithOptions(options ClientOptions) error {
 			}
 			c.ClientId = assigned
 		}
-		if options.KeepAlive > 0 {
-			c.keepAlive = time.Duration(options.KeepAlive) * time.Second
+		keepAlive := options.KeepAlive
+		if options.ProtocolVersion == proto.Version5 {
+			if value, ok := propertyUint16(ack.Properties, proto.PropertyServerKeepAlive); ok {
+				keepAlive = value
+			}
+		}
+		if keepAlive > 0 {
+			c.keepAlive = time.Duration(keepAlive) * time.Second
 			c.keepAliveOnce.Do(func() { go c.keepAliveLoop() })
 		}
 		return nil
@@ -540,6 +562,9 @@ func (c *ClientConn) Publish(m *proto.Publish) error {
 	if m.QosLevel > proto.QosExactlyOnce || (m.QosLevel == proto.QosExactlyOnce && !c.EnableQoS2) {
 		return fmt.Errorf("mqtt: unsupported QoS level %d", m.QosLevel)
 	}
+	if m.QosLevel > c.maximumQoS {
+		return fmt.Errorf("mqtt: QoS level %d exceeds server maximum %d", m.QosLevel, c.maximumQoS)
+	}
 	allocated := false
 	if m.QosLevel.HasId() {
 		id, err := c.nextid()
@@ -581,6 +606,15 @@ func (c *ClientConn) sync(m proto.Message) (err error) {
 	case err = <-j.r:
 		return err
 	case <-c.closed:
-		return ErrClientClosed
+		// The peer can close immediately after receiving our packet (notably
+		// DISCONNECT), before the writer publishes its successful receipt.
+		// Wait for the writer to finish before deciding whether the send failed.
+		<-c.done
+		select {
+		case err = <-j.r:
+			return err
+		default:
+			return ErrClientClosed
+		}
 	}
 }

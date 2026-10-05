@@ -83,7 +83,7 @@ func (c *incomingConn) takeWill() (*proto.Publish, time.Duration) {
 			remaining := time.Until(c.session.ExpiresAt)
 			if remaining <= 0 {
 				delay = 0
-			} else if delay == 0 || remaining < delay {
+			} else if remaining < delay {
 				delay = remaining
 			}
 		}
