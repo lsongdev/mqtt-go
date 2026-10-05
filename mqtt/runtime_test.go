@@ -178,3 +178,36 @@ func TestBrokerPacketIdentifierWrapSkipsZero(t *testing.T) {
 		t.Fatalf("wrapped id = %d", id)
 	}
 }
+
+func TestClientKeepAliveClosesWhenPingResponseIsMissing(t *testing.T) {
+	serverSide, clientSide := net.Pipe()
+	defer serverSide.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		if _, err := proto.DecodeOneMessage(serverSide, nil); err != nil {
+			return
+		}
+		if err := (&proto.ConnAck{}).Encode(serverSide); err != nil {
+			return
+		}
+		_, _ = proto.DecodeOneMessage(serverSide, nil) // PINGREQ; intentionally no PINGRESP.
+	}()
+
+	client := NewClientConn(clientSide)
+	if err := client.ConnectWithOptions(ClientOptions{
+		ClientID:   "keepalive-client",
+		CleanStart: true,
+		KeepAlive:  1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-client.closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("client kept connection open without PINGRESP")
+	}
+	<-serverDone
+}
